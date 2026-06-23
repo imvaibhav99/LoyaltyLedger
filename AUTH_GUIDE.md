@@ -1,0 +1,1339 @@
+# Authentication System Guide — LoyaltyLedger
+### Written for: Vaibhav (Fresher SDE) | By: Senior Engineering Perspective
+
+---
+
+## How to read this document
+
+Read it **top to bottom, once, before writing a single line of code.** The concepts in Part 1 will make every line you write in Parts 2 and 3 make complete sense. If you skip to the code, you'll copy it without understanding — and that will fail you in interviews and in debugging.
+
+---
+
+# PART 1 — THE CONCEPTS (Master These for Interviews)
+
+---
+
+## 1.1 Authentication vs Authorization — The Most Commonly Confused Pair
+
+These are two different questions asked at two different points in every request.
+
+| Term | Question | Example |
+|---|---|---|
+| **Authentication (AuthN)** | *Who are you?* | "I am Vaibhav, the platform admin" |
+| **Authorization (AuthZ)** | *What are you allowed to do?* | "You can see all tenants, but a merchant staff cannot" |
+
+**Authentication happens first, always.** You cannot authorize someone you don't know yet.
+
+In code terms: auth middleware runs first, sets `req.user = { userId, tenantId, role }`, and THEN the role-check middleware uses `req.user.role` to decide if the action is allowed.
+
+**Interview answer:** "Authentication verifies identity using credentials (password, token). Authorization verifies permissions using that identity. They are sequential — you can't skip or reverse the order."
+
+---
+
+## 1.2 Why We Don't Use Sessions (and What We Use Instead)
+
+### The old way — Sessions
+1. User logs in → server creates a "session" entry in the database → gives user a session ID cookie
+2. Every request: server reads cookie → goes to DB → looks up session → checks who the user is
+3. **Problem:** Every single request hits the database. If you have 1 million users, that's 1 million+ DB reads per minute just for authentication. It also means your server is "stateful" — it has to remember things. You can't run 10 servers in parallel without them sharing the same session store (Redis, etc.)
+
+### The modern way — JWT (JSON Web Tokens)
+1. User logs in → server verifies password → **signs a token** with a secret key → sends token to client
+2. Every request: client sends token in header → server **mathematically verifies the token** — no DB needed
+3. **The magic:** The server can verify the token is valid without any database lookup, because only the server knows the secret key that was used to sign it.
+
+**The result is a stateless server.** You can run 10 identical API servers, and any of them can verify any token, because they all share the same secret key. This is horizontal scaling.
+
+**Interview answer:** "JWTs allow stateless authentication. The server embeds the user's identity into a cryptographically signed token. Any server instance with the signing secret can verify it without a database round-trip. This enables horizontal scaling."
+
+---
+
+## 1.3 Anatomy of a JWT — Know This Cold
+
+A JWT looks like this:
+
+```
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiI2NjEiLCJyb2xlIjoiTUVSQ0hBTlRfT1dORVIiLCJ0ZW5hbnRJZCI6IjEyMyIsImlhdCI6MTcwMDAwMDAwMCwiZXhwIjoxNzAwMDAwOTAwfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+```
+
+It has **exactly three parts separated by dots:**
+
+```
+HEADER . PAYLOAD . SIGNATURE
+```
+
+### Part 1 — Header (base64 encoded, not encrypted)
+```json
+{
+  "alg": "HS256",
+  "typ": "JWT"
+}
+```
+Says: "I am a JWT, signed with HMAC-SHA256 algorithm."
+
+### Part 2 — Payload / Claims (base64 encoded, NOT encrypted — anyone can read it)
+```json
+{
+  "userId": "661",
+  "tenantId": "123",
+  "role": "MERCHANT_OWNER",
+  "iat": 1700000000,
+  "exp": 1700000900
+}
+```
+- `iat` = issued at (Unix timestamp)
+- `exp` = expiry time (Unix timestamp). Library auto-rejects expired tokens.
+- `userId`, `tenantId`, `role` = our custom claims
+
+**CRITICAL:** The payload is NOT encrypted. It is only Base64-encoded. Anyone can decode it. This means:
+- **Never put sensitive data in a JWT payload** (no passwords, no credit card numbers, no secrets)
+- What goes in: identity data that you'd be OK with the client seeing
+
+### Part 3 — Signature (this is the security)
+```
+HMACSHA256(
+  base64(header) + "." + base64(payload),
+  YOUR_SECRET_KEY
+)
+```
+The signature is created by running the header + payload through a hashing function using your server's secret key. 
+
+**Why this provides security:** If someone modifies the payload (e.g., changes `role: "MERCHANT_STAFF"` to `role: "PLATFORM_ADMIN"`), the signature will no longer match. The server rejects it. You cannot forge a valid signature without knowing the secret key.
+
+**Interview answer:** "JWT has three base64-encoded parts: header (algorithm), payload (claims), and signature. The signature is an HMAC hash of the header+payload using the server secret. Any tampering with the payload invalidates the signature. The payload is readable by anyone — you must never put secrets in it."
+
+---
+
+## 1.4 The Access Token + Refresh Token Pattern
+
+Here's a core problem: if JWTs are stateless, how do you log someone out? You can't "delete" a token — it's just a string in the client's memory. Once issued, it's valid until it expires.
+
+**The solution:** make access tokens expire very quickly (15 minutes), and use a separate refresh token to get new ones.
+
+```
+ACCESS TOKEN  — expires in 15 minutes
+REFRESH TOKEN — expires in 7 days
+```
+
+### The flow in practice:
+
+```
+LOGIN:
+  Client sends email + password
+  Server verifies → issues BOTH tokens
+  Client stores both
+
+NORMAL REQUESTS (first 15 min):
+  Client sends: Authorization: Bearer <access_token>
+  Server verifies access token → serves request
+
+AFTER 15 MIN:
+  Access token expires
+  Client sends: POST /api/auth/refresh with refresh_token
+  Server verifies refresh token → issues a new access token
+  Client uses new access token for next 15 min
+
+AFTER 7 DAYS:
+  Refresh token expires
+  Client must log in again
+
+LOGOUT:
+  Client discards both tokens (and optionally server blacklists refresh token)
+```
+
+### Why two tokens instead of one long-lived token?
+
+If you had one token with 7-day expiry and it was stolen (e.g., XSS attack), the attacker has 7-day access.
+
+With this pattern:
+- Stolen access token → attacker gets 15 minutes max
+- Stolen refresh token → attacker can get new access tokens, BUT you can detect this with refresh token rotation
+
+### Refresh Token Rotation (Advanced — important for interviews)
+
+Every time a refresh token is used, the server:
+1. Invalidates the old refresh token
+2. Issues a brand new refresh token
+
+If a stolen refresh token is used by an attacker, and then the real user tries to refresh, the server sees the old (already-used) token → detects a reuse → invalidates the entire session → forces re-login.
+
+**Interview answer:** "Short-lived access tokens minimize the window of damage from token theft. Refresh tokens with rotation allow long sessions while detecting token reuse — if a stolen refresh token is used, the next legitimate use sees it as already-consumed and invalidates the session."
+
+---
+
+## 1.5 Password Hashing with bcrypt — Why You NEVER Store Passwords
+
+If you store `password: "mypassword123"` in your database and someone breaches your DB, every user's password is exposed — including passwords they reuse on their bank accounts. This is a catastrophic security failure.
+
+**Hashing:** A one-way function. `hash("mypassword123") = "$2b$12$abc...xyz"`. You cannot reverse it to get "mypassword123". You can only hash a new input and compare.
+
+**bcrypt is special because it is intentionally slow:**
+
+```
+MD5 hash:    ~1 billion hashes/second (fast = bad for passwords)
+bcrypt(12):  ~300 hashes/second       (slow = good for passwords)
+```
+
+The cost factor (12 in our case) makes it take ~300ms per hash. This makes brute-force attacks impractical — an attacker testing millions of passwords will be blocked by time.
+
+**Salt:** bcrypt automatically generates a random "salt" (random string mixed into your password before hashing). Even if two users have the same password, their hashes will be different. This defeats rainbow table attacks (pre-computed hash dictionaries).
+
+```
+// What bcrypt stores (the hash contains the salt inside it):
+"$2b$12$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+   ↑    ↑   ↑
+  algo cost  salt + hash (all in one string)
+```
+
+**Verify flow:**
+```
+User sends "mypassword123"
+bcrypt.compare("mypassword123", storedHash)
+ → extracts salt from storedHash
+ → hashes the input with that same salt
+ → compares result to storedHash
+ → returns true/false
+```
+
+**Interview answer:** "bcrypt is a slow, salted hashing algorithm. Slow = brute-force resistant. Salted = same password produces different hashes, defeating rainbow tables. We store only the hash, never the plaintext. We use bcrypt.compare() to verify — we never decrypt."
+
+---
+
+## 1.6 RBAC — Role-Based Access Control
+
+In our system, different users can do different things. We encode this as a role.
+
+```
+PLATFORM_ADMIN   → can do everything, see all tenants, manage platform
+MERCHANT_OWNER   → can manage their tenant: create staff, configure programs, see all analytics
+MERCHANT_MANAGER → can manage day-to-day: view/edit members, transactions (no billing, no staff creation)
+MERCHANT_STAFF   → can operate POS: earn/redeem points for members
+MEMBER           → can view their own loyalty profile (mobile app use case, optional MVP)
+```
+
+**Implementation:** A middleware factory `requireRole(...allowedRoles)` that checks `req.user.role`:
+
+```javascript
+// Route definition:
+router.post('/staff', requireRole('MERCHANT_OWNER', 'MERCHANT_MANAGER'), createStaffController);
+
+// If a MERCHANT_STAFF tries to hit this route, they get 403 Forbidden
+```
+
+**Why a factory function?** Because different routes need different role requirements. A factory lets you pass the allowed roles at route definition time.
+
+**Interview answer:** "RBAC assigns permissions to roles, not to individual users. You check the role on every protected route. A middleware factory `requireRole(...roles)` reads `req.user.role` (set by auth middleware) and rejects with 403 if the role isn't in the allowed list."
+
+---
+
+## 1.7 Multi-Tenancy + Auth — The Core of This System
+
+This is the most unique challenge in LoyaltyLedger. A single database contains data for 100 different merchants. Merchant A must NEVER see Merchant B's data.
+
+**How we enforce this:**
+
+1. **Every user document has a `tenantId` field** (except Platform Admin, who has `null`)
+2. **`tenantId` is embedded in the JWT payload** when the token is issued
+3. **Every service function receives `tenantId` as an explicit argument** and includes it in every DB query
+
+```javascript
+// Service function — tenantId ALWAYS scopes the query
+async function getMember(tenantId, memberId) {
+  return Member.findOne({ _id: memberId, tenantId });
+  //                                      ↑ this is the isolation guarantee
+}
+```
+
+If `tenantId` wasn't in the query and a merchant somehow got a memberId from another tenant, they'd see that member's data. The explicit `tenantId` filter on every query prevents this.
+
+**Why put `tenantId` in the JWT?** Because the JWT is signed. A malicious user cannot change their `tenantId` from "merchant-A" to "merchant-B" — changing the payload would break the signature and the server would reject the token. So `tenantId` in JWT = unforgeable tenant identity.
+
+**The Platform Admin exception:** Platform Admin has `tenantId: null` in their token. When Platform Admin calls a route, the service can be given the target `tenantId` from the request params (e.g., `GET /api/platform/tenants/:tenantId/members`).
+
+**Interview answer:** "In our shared-database multi-tenant architecture, tenant isolation is enforced at two layers: the JWT claim (tenantId cannot be forged because the token is signed) and the DB query filter (every query includes tenantId). Defense in depth — neither alone is sufficient."
+
+---
+
+# PART 2 — OUR SYSTEM DESIGN
+
+---
+
+## 2.1 Who Are the Users? (User Types)
+
+```
+┌──────────────────────────────────────────────────────┐
+│                  LoyaltyLedger Platform               │
+│                                                       │
+│  PLATFORM_ADMIN (you — Vaibhav)                       │
+│  tenantId: null                                       │
+│  Created by: seed script (not signup)                 │
+│  Can: see all tenants, manage plans, platform ops     │
+│                                                       │
+│  ┌──────────────────┐   ┌──────────────────┐         │
+│  │  Tenant: "ZestCafe"│   │ Tenant: "MegaMart"│         │
+│  │  tenantId: abc123 │   │ tenantId: def456  │         │
+│  │                   │   │                   │         │
+│  │  MERCHANT_OWNER   │   │  MERCHANT_OWNER   │         │
+│  │  MERCHANT_MANAGER │   │  MERCHANT_MANAGER │         │
+│  │  MERCHANT_STAFF   │   │  MERCHANT_STAFF   │         │
+│  └──────────────────┘   └──────────────────┘         │
+└──────────────────────────────────────────────────────┘
+```
+
+---
+
+## 2.2 The Three Authentication Flows
+
+### Flow A — Platform Admin Login
+```
+POST /api/auth/login
+Body: { email, password }
+
+1. Find User where email = given email AND role = PLATFORM_ADMIN
+2. Verify password with bcrypt
+3. Issue access token: { userId, tenantId: null, role: "PLATFORM_ADMIN" }
+4. Issue refresh token
+5. Return both tokens
+```
+
+### Flow B — Merchant Signup (Tenant Registration)
+```
+POST /api/auth/signup
+Body: { businessName, ownerName, email, password, plan }
+
+This is the MOST complex flow because you create TWO documents atomically:
+
+START MongoDB Transaction
+  1. Create Tenant: { businessName, plan, status: "active" }
+  2. Hash the password
+  3. Create User: { tenantId: newTenant._id, name: ownerName, email, passwordHash, role: "MERCHANT_OWNER" }
+  4. If either fails → rollback both (atomicity guarantee)
+COMMIT Transaction
+
+5. Issue access token: { userId, tenantId: newTenant._id, role: "MERCHANT_OWNER" }
+6. Issue refresh token
+7. Return both tokens + tenant info
+```
+
+**Why a transaction?** If the Tenant record is created but the User creation fails (e.g., duplicate email), you'd have an orphaned Tenant with no owner. Transactions ensure both succeed or neither does.
+
+### Flow C — Tenant User Login (Owner / Manager / Staff)
+```
+POST /api/auth/login
+Body: { email, password }
+(Same endpoint as Platform Admin — resolved by lookup)
+
+1. Find User where email = given email
+   (email is globally unique in practice — see design note below)
+2. If not found → 401 "Invalid credentials" (generic — don't reveal if email exists)
+3. Verify password with bcrypt
+4. Issue access token: { userId, tenantId: user.tenantId, role: user.role }
+5. Issue refresh token
+6. Return tokens
+```
+
+### Design Note on Email Uniqueness
+The DB has a compound unique index `(tenantId, email)` — the same email CAN theoretically exist in two different tenants. But for a SaaS where staff use their work emails to log in, emails will be globally unique in practice. For MVP, we find by email alone and get the tenantId from the user document. This is the simplest and most user-friendly approach.
+
+---
+
+## 2.3 JWT Claims Design
+
+```javascript
+// Access Token payload
+{
+  userId:   "64f...",      // User's MongoDB _id
+  tenantId: "65a..." | null,  // null for Platform Admin
+  role:     "MERCHANT_OWNER", // One of the 5 roles
+  iat:      1700000000,    // Issued at
+  exp:      1700000900     // 15 minutes later
+}
+
+// Refresh Token payload (minimal — just enough to find the user)
+{
+  userId:   "64f...",
+  tokenVersion: 1,         // For rotation/invalidation
+  iat:      1700000000,
+  exp:      1700604800     // 7 days later
+}
+```
+
+---
+
+## 2.4 The Middleware Chain — Every Protected Request
+
+```
+Incoming Request
+      │
+      ▼
+┌─────────────┐
+│   validate  │ ← zod checks req.body/params shape. Reject 400 if wrong.
+└──────┬──────┘
+       │
+       ▼
+┌─────────────┐
+│    auth     │ ← Extract Bearer token. Verify JWT. Set req.user. Reject 401 if missing/invalid.
+└──────┬──────┘
+       │
+       ▼
+┌─────────────┐
+│    rbac     │ ← Check req.user.role is in the allowed list. Reject 403 if not.
+└──────┬──────┘
+       │
+       ▼
+┌─────────────┐
+│ controller  │ ← Thin handler. Reads req, calls service, sends res.
+└──────┬──────┘
+       │
+       ▼
+┌─────────────┐
+│   service   │ ← Business logic. Receives tenantId + actorUserId. Does DB work.
+└─────────────┘
+```
+
+**Note on `tenantMiddleware`:** We don't need a separate tenant middleware for most routes because the tenantId is baked into the JWT. The controller extracts `req.user.tenantId` and passes it to the service. The service uses it in every query. Tenant isolation is enforced at the service layer.
+
+---
+
+## 2.5 Files You Need to Create (Implementation Roadmap)
+
+```
+Step 1: server/src/config/constants.js       ← Role constants, token config
+Step 2: server/src/config/env.js             ← Environment variable validation
+Step 3: server/src/config/db.js              ← MongoDB connection
+Step 4: server/src/models/Tenant.js          ← Tenant schema
+Step 5: server/src/models/User.js            ← Fix existing bugs + complete it
+Step 6: server/src/utils/ApiError.js         ← Custom error class
+Step 7: server/src/utils/asyncHandler.js     ← Wraps async controllers
+Step 8: server/src/utils/token.js            ← JWT sign/verify helpers
+Step 9: server/src/services/authService.js   ← Login, signup, refresh logic
+Step 10: server/src/controllers/authController.js  ← Thin HTTP handlers
+Step 11: server/src/middleware/auth.js        ← verifyToken middleware
+Step 12: server/src/middleware/rbac.js        ← requireRole factory
+Step 13: server/src/middleware/error.js       ← Central error handler
+Step 14: server/src/validators/authValidator.js ← zod schemas
+Step 15: server/src/routes/auth.js            ← /api/auth/* routes
+Step 16: server/src/routes/index.js           ← Root router
+Step 17: server/src/app.js                    ← Express app setup
+Step 18: server/src/server.js                 ← DB connect + listen
+Step 19: scripts/seedAdmin.js                 ← Create your Platform Admin account
+```
+
+---
+
+# PART 3 — STEP-BY-STEP IMPLEMENTATION
+
+---
+
+## BEFORE YOU START — Fix package.json
+
+Your current `package.json` says `"type": "commonjs"` but the TRD mandates ES Modules. Also, you're missing most dependencies.
+
+**Replace the entire `server/package.json` with this:**
+
+```json
+{
+  "name": "loyaltyledger-server",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "seed": "node scripts/seedAdmin.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.0.3",
+    "morgan": "^1.10.0",
+    "node-cron": "^3.0.3",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "vitest": "^1.0.4",
+    "supertest": "^6.3.3"
+  }
+}
+```
+
+Then run: `npm install`
+
+**Why bcryptjs and NOT bcrypt?** `bcrypt` is a native C++ addon — it requires compilation tools (Python, build tools). `bcryptjs` is pure JavaScript — works everywhere, no compilation needed. Same API, virtually same performance for our scale.
+
+---
+
+## STEP 1 — `server/src/config/constants.js`
+
+This file is the single source of truth for all constant values.
+
+```javascript
+export const USER_ROLES = {
+  PLATFORM_ADMIN:   'PLATFORM_ADMIN',
+  MERCHANT_OWNER:   'MERCHANT_OWNER',
+  MERCHANT_MANAGER: 'MERCHANT_MANAGER',
+  MERCHANT_STAFF:   'MERCHANT_STAFF',
+  MEMBER:           'MEMBER',
+};
+
+export const TOKEN_CONFIG = {
+  ACCESS_EXPIRY:  '15m',
+  REFRESH_EXPIRY: '7d',
+};
+
+export const BCRYPT_ROUNDS = 12;
+```
+
+**Why constants and not magic strings?** If you type `'MERCHANT_OWNER'` in 50 places and later rename it, you'll miss some. If you use `USER_ROLES.MERCHANT_OWNER`, your editor can find all references.
+
+---
+
+## STEP 2 — `server/src/config/env.js`
+
+All environment variables go through this file. If a required variable is missing, the app crashes immediately at startup with a clear message — better than a cryptic error 3 hours later.
+
+```javascript
+const required = (name) => {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing required environment variable: ${name}`);
+  return value;
+};
+
+export const env = {
+  NODE_ENV:          process.env.NODE_ENV || 'development',
+  PORT:              process.env.PORT || 5000,
+  MONGODB_URI:       required('MONGODB_URI'),
+  JWT_ACCESS_SECRET: required('JWT_ACCESS_SECRET'),
+  JWT_REFRESH_SECRET: required('JWT_REFRESH_SECRET'),
+  CLIENT_ORIGIN:     process.env.CLIENT_ORIGIN || 'http://localhost:5173',
+};
+```
+
+**Create `server/.env`** (and make sure it's in `.gitignore` — NEVER commit this):
+
+```
+NODE_ENV=development
+PORT=5000
+MONGODB_URI=mongodb+srv://your-username:your-password@cluster.mongodb.net/loyaltyledger?retryWrites=true&w=majority
+JWT_ACCESS_SECRET=your-super-secret-access-key-at-least-32-chars
+JWT_REFRESH_SECRET=your-different-super-secret-refresh-key-at-least-32-chars
+CLIENT_ORIGIN=http://localhost:5173
+```
+
+**Generate secure secrets:** In terminal: `node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"`  
+Run it twice — one for ACCESS_SECRET, one for REFRESH_SECRET. They must be different.
+
+---
+
+## STEP 3 — `server/src/config/db.js`
+
+```javascript
+import mongoose from 'mongoose';
+import { env } from './env.js';
+
+export async function connectDB() {
+  const conn = await mongoose.connect(env.MONGODB_URI);
+  console.log(`MongoDB connected: ${conn.connection.host}`);
+}
+```
+
+**Concept:** We export a function, not a side-effect. `server.js` will call `connectDB()` before `app.listen()`. This ensures we never accept HTTP requests while the DB is still connecting.
+
+---
+
+## STEP 4 — `server/src/models/Tenant.js`
+
+```javascript
+import mongoose from 'mongoose';
+
+const tenantSchema = new mongoose.Schema(
+  {
+    businessName: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    slug: {
+      type: String,
+      required: true,
+      unique: true,
+      lowercase: true,
+      trim: true,
+    },
+    plan: {
+      type: String,
+      enum: ['starter', 'growth', 'enterprise'],
+      default: 'starter',
+    },
+    status: {
+      type: String,
+      enum: ['active', 'suspended', 'cancelled'],
+      default: 'active',
+    },
+    billingEmail: {
+      type: String,
+      lowercase: true,
+      trim: true,
+    },
+  },
+  { timestamps: true }
+);
+
+tenantSchema.set('toJSON', {
+  virtuals: true,
+  transform: (_doc, ret) => {
+    ret.id = ret._id;
+    delete ret._id;
+    delete ret.__v;
+    return ret;
+  },
+});
+
+export const Tenant = mongoose.model('Tenant', tenantSchema);
+```
+
+**Concept — `timestamps: true`:** Mongoose automatically adds `createdAt` and `updatedAt` fields. You never manage them manually.
+
+**Concept — `toJSON` transform:** Whenever Mongoose converts a document to JSON (to send as API response), this runs. We rename `_id` to `id` (more frontend-friendly), remove `__v` (internal Mongoose version key), and remove any sensitive fields.
+
+---
+
+## STEP 5 — `server/src/models/User.js` (Fixed and Complete)
+
+Here is the corrected version. I'll list every bug from your original below.
+
+```javascript
+import mongoose from 'mongoose';
+import bcrypt from 'bcryptjs';
+import { USER_ROLES, BCRYPT_ROUNDS } from '../config/constants.js';
+
+const userSchema = new mongoose.Schema(
+  {
+    tenantId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Tenant',
+      default: null,   // null for PLATFORM_ADMIN
+    },
+    name: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    email: {
+      type: String,
+      required: true,
+      lowercase: true,
+      trim: true,
+    },
+    passwordHash: {
+      type: String,
+      required: true,
+      select: false,   // NEVER returned in queries by default
+    },
+    role: {
+      type: String,
+      enum: Object.values(USER_ROLES),
+      default: USER_ROLES.MERCHANT_OWNER,
+    },
+  },
+  { timestamps: true }   // ← was "timeStamp" (wrong) in your original
+);
+
+// Compound unique index: same email CAN exist across tenants, but not within one tenant
+userSchema.index({ tenantId: 1, email: 1 }, { unique: true });
+
+userSchema.methods.setPassword = async function (plaintext) {
+  this.passwordHash = await bcrypt.hash(plaintext, BCRYPT_ROUNDS);
+};
+
+userSchema.methods.verifyPassword = async function (plaintext) {
+  return bcrypt.compare(plaintext, this.passwordHash);  // ← was "bctrypt" (typo) in your original
+};
+
+userSchema.set('toJSON', {
+  virtuals: true,
+  transform: (_doc, ret) => {
+    ret.id = ret._id;
+    delete ret._id;
+    delete ret.__v;
+    delete ret.passwordHash;  // Always strip — even if someone fetches with .select('+passwordHash')
+    return ret;
+  },
+});
+
+export const User = mongoose.model('User', userSchema);
+```
+
+**Bugs fixed from your original:**
+1. `import bcrypt from 'bcryptjs'` — was missing entirely
+2. `import { type } from 'node:os'` — removed (unused, made no sense)
+3. `import { timeStamp } from 'node:console'` — removed (unused, made no sense)
+4. `{ timeStamp: true }` → `{ timestamps: true }` — Mongoose option is `timestamps`, not `timeStamp`
+5. `bctrypt.compare` → `bcrypt.compare` — typo in verifyPassword
+
+**Why `select: false` on passwordHash?** When you do `User.findOne({ email })`, Mongoose will NOT include `passwordHash` in the result. This means even if you forget to strip it, it won't leak. When you explicitly need it (login), you do `User.findOne({ email }).select('+passwordHash')`.
+
+---
+
+## STEP 6 — `server/src/utils/ApiError.js`
+
+```javascript
+export class ApiError extends Error {
+  constructor(statusCode, message, details = null) {
+    super(message);
+    this.statusCode = statusCode;
+    this.details = details;
+  }
+}
+```
+
+**Concept:** We create a custom error class so we can throw meaningful errors from service functions:
+
+```javascript
+throw new ApiError(401, 'Invalid credentials');
+throw new ApiError(409, 'Email already registered');
+throw new ApiError(403, 'Insufficient permissions');
+```
+
+The central error middleware will catch these and format them into our standard error envelope.
+
+---
+
+## STEP 7 — `server/src/utils/asyncHandler.js`
+
+```javascript
+export const asyncHandler = (fn) => (req, res, next) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
+```
+
+**Concept — why this exists:**
+
+Without asyncHandler, every async controller needs its own try/catch:
+```javascript
+// WITHOUT asyncHandler — repetitive and error-prone
+async function loginController(req, res, next) {
+  try {
+    const result = await authService.login(req.body);
+    res.json({ success: true, data: result });
+  } catch (err) {
+    next(err);  // you MUST call next(err) or Express won't catch it
+  }
+}
+```
+
+With asyncHandler, you wrap once and forget try/catch:
+```javascript
+// WITH asyncHandler — clean
+export const loginController = asyncHandler(async (req, res) => {
+  const result = await authService.login(req.body);
+  res.json({ success: true, data: result });
+});
+// Any thrown error is automatically passed to next(err)
+```
+
+**How it works:** `asyncHandler` returns a new function that wraps your async function. When the async function throws, `.catch(next)` automatically calls Express's `next` with the error, sending it to the error middleware.
+
+---
+
+## STEP 8 — `server/src/utils/token.js`
+
+```javascript
+import jwt from 'jsonwebtoken';
+import { env } from '../config/env.js';
+import { TOKEN_CONFIG } from '../config/constants.js';
+
+export function signAccessToken(payload) {
+  return jwt.sign(payload, env.JWT_ACCESS_SECRET, {
+    expiresIn: TOKEN_CONFIG.ACCESS_EXPIRY,
+  });
+}
+
+export function signRefreshToken(payload) {
+  return jwt.sign(payload, env.JWT_REFRESH_SECRET, {
+    expiresIn: TOKEN_CONFIG.REFRESH_EXPIRY,
+  });
+}
+
+export function verifyAccessToken(token) {
+  // jwt.verify throws if token is invalid or expired — let it bubble up
+  return jwt.verify(token, env.JWT_ACCESS_SECRET);
+}
+
+export function verifyRefreshToken(token) {
+  return jwt.verify(token, env.JWT_REFRESH_SECRET);
+}
+```
+
+**Concept:** We use TWO different secrets for access and refresh tokens. Why? So a stolen refresh secret doesn't also compromise access token verification, and vice versa. Defense in depth.
+
+**What `jwt.verify` does:**
+1. Splits the token into header + payload + signature
+2. Recomputes the signature using the secret
+3. Compares — if it doesn't match, throws `JsonWebTokenError`
+4. Checks expiry — if expired, throws `TokenExpiredError`
+5. If everything is fine, returns the decoded payload
+
+---
+
+## STEP 9 — `server/src/services/authService.js`
+
+This is the brain of authentication. All logic lives here. No `req` or `res` — just data in, data out.
+
+```javascript
+import mongoose from 'mongoose';
+import { User } from '../models/User.js';
+import { Tenant } from '../models/Tenant.js';
+import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../utils/token.js';
+import { ApiError } from '../utils/ApiError.js';
+import { USER_ROLES } from '../config/constants.js';
+
+// ─── HELPER ────────────────────────────────────────────────────────────────
+
+function buildTokens(user) {
+  const accessPayload  = { userId: user.id, tenantId: user.tenantId, role: user.role };
+  const refreshPayload = { userId: user.id };
+  return {
+    accessToken:  signAccessToken(accessPayload),
+    refreshToken: signRefreshToken(refreshPayload),
+  };
+}
+
+// ─── LOGIN (Platform Admin + All Tenant Users — same endpoint) ─────────────
+
+export async function login({ email, password }) {
+  // 1. Find user by email. We need passwordHash, so .select('+passwordHash')
+  const user = await User.findOne({ email }).select('+passwordHash');
+
+  // 2. Generic error — never reveal whether the email exists or the password is wrong.
+  //    Both cases return the same message. This prevents user enumeration attacks.
+  if (!user) throw new ApiError(401, 'Invalid credentials');
+
+  // 3. Verify password
+  const valid = await user.verifyPassword(password);
+  if (!valid) throw new ApiError(401, 'Invalid credentials');
+
+  // 4. Issue tokens
+  const tokens = buildTokens(user);
+
+  return { user, ...tokens };
+}
+
+// ─── MERCHANT SIGNUP ───────────────────────────────────────────────────────
+
+export async function signup({ businessName, ownerName, email, password, plan }) {
+  // Check for existing email before starting transaction (faster fail path)
+  const existing = await User.findOne({ email });
+  if (existing) throw new ApiError(409, 'An account with this email already exists');
+
+  // MongoDB multi-document transaction
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    // Generate slug from businessName: "Zest Cafe" → "zest-cafe"
+    const slug = businessName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+
+    // Check slug uniqueness
+    const existingTenant = await Tenant.findOne({ slug }).session(session);
+    if (existingTenant) throw new ApiError(409, 'Business name already taken');
+
+    // Create Tenant (array form required for sessions with .create())
+    const [tenant] = await Tenant.create(
+      [{ businessName, slug, plan: plan || 'starter', billingEmail: email }],
+      { session }
+    );
+
+    // Create User (as MERCHANT_OWNER of the new tenant)
+    const [user] = await User.create(
+      [{ tenantId: tenant._id, name: ownerName, email, role: USER_ROLES.MERCHANT_OWNER }],
+      { session }
+    );
+
+    // Hash password and save (we can't use pre-save hook easily in transactions)
+    await user.setPassword(password);
+    await user.save({ session });
+
+    await session.commitTransaction();
+
+    const tokens = buildTokens(user);
+    return { user, tenant, ...tokens };
+
+  } catch (err) {
+    await session.abortTransaction();
+    throw err;  // Re-throw so asyncHandler → error middleware handles it
+  } finally {
+    session.endSession();
+  }
+}
+
+// ─── REFRESH TOKENS ────────────────────────────────────────────────────────
+
+export async function refresh(refreshToken) {
+  if (!refreshToken) throw new ApiError(401, 'Refresh token required');
+
+  let payload;
+  try {
+    payload = verifyRefreshToken(refreshToken);
+  } catch {
+    throw new ApiError(401, 'Invalid or expired refresh token');
+  }
+
+  // Fetch user to get latest role/tenantId (in case they changed since token was issued)
+  const user = await User.findById(payload.userId);
+  if (!user) throw new ApiError(401, 'User no longer exists');
+
+  const tokens = buildTokens(user);
+  return tokens;
+}
+```
+
+**Concept — Why re-fetch user on refresh?** If you change a user's role (e.g., promote staff to manager), the old access token still has the old role for up to 15 minutes. That's acceptable — it's the intentional trade-off of JWTs. But the refresh flow gives us a chance to embed the freshest data. So on refresh, we always query the DB for the current user state.
+
+---
+
+## STEP 10 — `server/src/controllers/authController.js`
+
+Thin handlers. No logic. Read req → call service → write res.
+
+```javascript
+import * as authService from '../services/authService.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
+
+export const login = asyncHandler(async (req, res) => {
+  const { user, accessToken, refreshToken } = await authService.login(req.body);
+  res.status(200).json({
+    success: true,
+    data: { user, accessToken, refreshToken },
+  });
+});
+
+export const signup = asyncHandler(async (req, res) => {
+  const { user, tenant, accessToken, refreshToken } = await authService.signup(req.body);
+  res.status(201).json({
+    success: true,
+    data: { user, tenant, accessToken, refreshToken },
+  });
+});
+
+export const refresh = asyncHandler(async (req, res) => {
+  const { refreshToken } = req.body;
+  const tokens = await authService.refresh(refreshToken);
+  res.status(200).json({ success: true, data: tokens });
+});
+
+export const me = asyncHandler(async (req, res) => {
+  // req.user is set by auth middleware. This endpoint just returns it.
+  res.status(200).json({ success: true, data: { user: req.user } });
+});
+```
+
+---
+
+## STEP 11 — `server/src/middleware/auth.js`
+
+```javascript
+import { verifyAccessToken } from '../utils/token.js';
+import { ApiError } from '../utils/ApiError.js';
+import { User } from '../models/User.js';
+
+export async function authenticate(req, _res, next) {
+  try {
+    // 1. Extract token from Authorization header
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith('Bearer ')) {
+      throw new ApiError(401, 'No token provided');
+    }
+    const token = authHeader.slice(7);  // Remove "Bearer " prefix
+
+    // 2. Verify the JWT — throws if invalid/expired
+    const payload = verifyAccessToken(token);
+
+    // 3. Attach user identity to the request object
+    //    Controllers and subsequent middleware use req.user
+    req.user = {
+      userId:   payload.userId,
+      tenantId: payload.tenantId,
+      role:     payload.role,
+    };
+
+    next();
+  } catch (err) {
+    // Convert JWT library errors to our ApiError format
+    if (err instanceof ApiError) return next(err);
+    if (err.name === 'TokenExpiredError') return next(new ApiError(401, 'Token expired'));
+    next(new ApiError(401, 'Invalid token'));
+  }
+}
+```
+
+**Concept — `req.user`:** Express `req` is just a plain JavaScript object. You can attach any properties to it. Middleware runs in sequence, and each middleware receives the same `req` object. So `authenticate` attaches `req.user`, and all subsequent middleware and controllers can read it. This is the standard pattern for passing user identity through the request lifecycle.
+
+---
+
+## STEP 12 — `server/src/middleware/rbac.js`
+
+```javascript
+import { ApiError } from '../utils/ApiError.js';
+
+// Factory function — returns a middleware with the allowed roles baked in
+export function requireRole(...allowedRoles) {
+  return (req, _res, next) => {
+    if (!req.user) {
+      return next(new ApiError(401, 'Authentication required'));
+    }
+    if (!allowedRoles.includes(req.user.role)) {
+      return next(new ApiError(403, 'Insufficient permissions'));
+    }
+    next();
+  };
+}
+```
+
+**Usage in routes:**
+```javascript
+// Only MERCHANT_OWNER can create staff accounts
+router.post('/users/staff', authenticate, requireRole('MERCHANT_OWNER'), createStaff);
+
+// Owner and Manager can view members
+router.get('/members', authenticate, requireRole('MERCHANT_OWNER', 'MERCHANT_MANAGER'), listMembers);
+
+// Platform Admin only
+router.get('/platform/tenants', authenticate, requireRole('PLATFORM_ADMIN'), listTenants);
+```
+
+**Concept — Factory pattern:** `requireRole` is not a middleware — it's a function that RETURNS a middleware. This lets you parameterize the allowed roles per route at definition time. When Express calls the returned function, `allowedRoles` is captured in the closure.
+
+---
+
+## STEP 13 — `server/src/middleware/error.js`
+
+```javascript
+import { ApiError } from '../utils/ApiError.js';
+import { env } from '../config/env.js';
+
+export function errorMiddleware(err, req, res, _next) {
+  // Default to 500 for unexpected errors
+  const statusCode = err instanceof ApiError ? err.statusCode : 500;
+  const message    = err instanceof ApiError ? err.message : 'Internal server error';
+
+  // Log the full error in development, just the message in production
+  if (env.NODE_ENV === 'development' || statusCode === 500) {
+    console.error(`[ERROR] ${req.method} ${req.url}`, err);
+  }
+
+  res.status(statusCode).json({
+    success: false,
+    message,
+    ...(err.details && { details: err.details }),
+    ...(env.NODE_ENV === 'development' && statusCode === 500 && { stack: err.stack }),
+  });
+}
+```
+
+**Concept — Express error middleware:** In Express, a middleware with FOUR parameters `(err, req, res, next)` is an error handler. When any middleware or controller calls `next(someError)`, Express skips all normal middleware and goes straight to this function. This is why `asyncHandler` calls `next(err)` on catch — it routes the error here.
+
+---
+
+## STEP 14 — `server/src/validators/authValidator.js`
+
+```javascript
+import { z } from 'zod';
+
+export const loginSchema = z.object({
+  email:    z.string().email('Invalid email format'),
+  password: z.string().min(1, 'Password is required'),
+});
+
+export const signupSchema = z.object({
+  businessName: z.string().min(2, 'Business name must be at least 2 characters'),
+  ownerName:    z.string().min(2, 'Name must be at least 2 characters'),
+  email:        z.string().email('Invalid email format'),
+  password:     z.string().min(8, 'Password must be at least 8 characters'),
+  plan:         z.enum(['starter', 'growth', 'enterprise']).optional(),
+});
+
+export const refreshSchema = z.object({
+  refreshToken: z.string().min(1, 'Refresh token is required'),
+});
+```
+
+---
+
+## STEP 15 — `server/src/middleware/validate.js`
+
+```javascript
+import { ApiError } from '../utils/ApiError.js';
+
+// Factory: takes a zod schema, returns a middleware
+export function validate(schema) {
+  return (req, _res, next) => {
+    const result = schema.safeParse(req.body);
+    if (!result.success) {
+      const details = result.error.errors.map(e => ({
+        field: e.path.join('.'),
+        message: e.message,
+      }));
+      return next(new ApiError(400, 'Validation failed', details));
+    }
+    req.body = result.data;  // Replace body with sanitized/coerced data
+    next();
+  };
+}
+```
+
+---
+
+## STEP 16 — `server/src/routes/auth.js`
+
+```javascript
+import { Router } from 'express';
+import * as authController from '../controllers/authController.js';
+import { authenticate } from '../middleware/auth.js';
+import { validate } from '../middleware/validate.js';
+import { loginSchema, signupSchema, refreshSchema } from '../validators/authValidator.js';
+
+const router = Router();
+
+// POST /api/auth/login
+router.post('/login', validate(loginSchema), authController.login);
+
+// POST /api/auth/signup
+router.post('/signup', validate(signupSchema), authController.signup);
+
+// POST /api/auth/refresh
+router.post('/refresh', validate(refreshSchema), authController.refresh);
+
+// GET /api/auth/me  (protected — requires valid access token)
+router.get('/me', authenticate, authController.me);
+
+export default router;
+```
+
+---
+
+## STEP 17 — `server/src/routes/index.js`
+
+```javascript
+import { Router } from 'express';
+import authRouter from './auth.js';
+
+const router = Router();
+
+router.use('/auth', authRouter);
+
+// Future routes plug in here:
+// router.use('/members', authenticate, membersRouter);
+// router.use('/programs', authenticate, programsRouter);
+// router.use('/platform', authenticate, requireRole('PLATFORM_ADMIN'), platformRouter);
+
+export default router;
+```
+
+---
+
+## STEP 18 — `server/src/app.js`
+
+```javascript
+import express from 'express';
+import helmet from 'helmet';
+import cors from 'cors';
+import morgan from 'morgan';
+import rateLimit from 'express-rate-limit';
+import { env } from './config/env.js';
+import router from './routes/index.js';
+import { errorMiddleware } from './middleware/error.js';
+
+const app = express();
+
+// Security headers
+app.use(helmet());
+
+// CORS — only allow requests from the React client
+app.use(cors({ origin: env.CLIENT_ORIGIN, credentials: true }));
+
+// Parse JSON bodies
+app.use(express.json());
+
+// Request logging (dev only)
+if (env.NODE_ENV === 'development') app.use(morgan('dev'));
+
+// Rate limiting on auth routes (max 20 attempts per 15 minutes per IP)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: { success: false, message: 'Too many requests, please try again later' },
+});
+app.use('/api/auth', authLimiter);
+
+// Health check (no auth required)
+app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+
+// All API routes
+app.use('/api', router);
+
+// Central error handler (MUST be last, after all routes)
+app.use(errorMiddleware);
+
+export default app;
+```
+
+---
+
+## STEP 19 — `server/src/server.js`
+
+```javascript
+import { connectDB } from './config/db.js';
+import { env } from './config/env.js';
+import app from './app.js';
+
+async function start() {
+  await connectDB();              // Connect to DB FIRST
+  app.listen(env.PORT, () => {   // Then start accepting requests
+    console.log(`Server running on port ${env.PORT} [${env.NODE_ENV}]`);
+  });
+}
+
+start().catch((err) => {
+  console.error('Failed to start server:', err);
+  process.exit(1);
+});
+```
+
+**Concept:** `app.js` builds the Express app (no `listen`). `server.js` connects the DB then starts listening. Tests can import `app` directly without starting the server or connecting the DB. This separation is the standard pattern for testable Node servers.
+
+---
+
+## STEP 20 — `server/scripts/seedAdmin.js`
+
+You (the Platform Admin) need a way to create your account without going through the public signup flow. A seed script solves this.
+
+```javascript
+import mongoose from 'mongoose';
+import { env } from '../src/config/env.js';
+import { connectDB } from '../src/config/db.js';
+import { User } from '../src/models/User.js';
+import { USER_ROLES } from '../src/config/constants.js';
+
+const ADMIN_EMAIL    = 'info@monilcorpus.com';  // your email
+const ADMIN_NAME     = 'Vaibhav Pandey';
+const ADMIN_PASSWORD = 'ChangeThisPassword123!'; // change immediately after first login
+
+async function seed() {
+  await connectDB();
+
+  const existing = await User.findOne({ email: ADMIN_EMAIL });
+  if (existing) {
+    console.log('Platform Admin already exists. Skipping.');
+    await mongoose.disconnect();
+    return;
+  }
+
+  const admin = new User({
+    tenantId: null,                    // Platform Admin has no tenant
+    name: ADMIN_NAME,
+    email: ADMIN_EMAIL,
+    role: USER_ROLES.PLATFORM_ADMIN,
+    passwordHash: 'placeholder',       // Will be overwritten below
+  });
+
+  await admin.setPassword(ADMIN_PASSWORD);
+  await admin.save();
+
+  console.log(`Platform Admin created: ${ADMIN_EMAIL}`);
+  await mongoose.disconnect();
+}
+
+seed().catch((err) => {
+  console.error('Seed failed:', err);
+  process.exit(1);
+});
+```
+
+Run with: `npm run seed`
+
+---
+
+# PART 4 — TESTING YOUR AUTH SYSTEM
+
+Once everything is wired up, test in this order using a REST client (Postman, Insomnia, or `curl`):
+
+```bash
+# 1. Start the server
+npm run dev
+
+# 2. Seed the admin
+npm run seed
+
+# 3. Test Platform Admin login
+curl -X POST http://localhost:5000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "info@monilcorpus.com", "password": "ChangeThisPassword123!"}'
+
+# 4. Test Merchant Signup
+curl -X POST http://localhost:5000/api/auth/signup \
+  -H "Content-Type: application/json" \
+  -d '{"businessName":"Zest Cafe","ownerName":"Raj Kumar","email":"raj@zestcafe.com","password":"SecurePass123!"}'
+
+# 5. Test protected route — use the accessToken from step 3 or 4
+curl -X GET http://localhost:5000/api/auth/me \
+  -H "Authorization: Bearer <paste_access_token_here>"
+
+# 6. Test token refresh
+curl -X POST http://localhost:5000/api/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d '{"refreshToken": "<paste_refresh_token_here>"}'
+```
+
+---
+
+# PART 5 — INTERVIEW CHEAT SHEET
+
+**Q: What is a JWT?**
+> A JWT is a stateless token with three parts: header (algo), payload (claims), signature. The signature is an HMAC hash of header+payload using a server secret. Any modification to the payload invalidates the signature. The server can verify tokens without a DB lookup — enabling stateless, horizontally scalable auth.
+
+**Q: Why access token + refresh token?**
+> Short-lived access tokens (15min) minimize damage from token theft. Refresh tokens (7 days) maintain long sessions. Refresh token rotation detects stolen tokens by flagging reuse of an already-consumed token.
+
+**Q: Why bcrypt and not SHA-256?**
+> SHA-256 is fast — attackers can compute billions of hashes/second. bcrypt is intentionally slow (configurable cost factor) and automatically salts the password, making brute-force and rainbow table attacks impractical.
+
+**Q: How do you prevent cross-tenant data leaks in a multi-tenant system?**
+> Two layers: (1) The JWT contains a signed tenantId that cannot be forged. (2) Every service function receives tenantId as an explicit argument and includes it in every DB query filter. Neither layer alone is sufficient — defense in depth.
+
+**Q: What is `select: false` in Mongoose?**
+> It excludes the field from all queries by default. Even if you forget to strip it before sending a response, it won't be included. You must explicitly opt-in with `.select('+fieldName')` when you need it (like during password verification).
+
+**Q: What does asyncHandler do?**
+> It's a higher-order function that wraps async route handlers. It resolves the promise and forwards any rejection to Express's `next(err)`, eliminating try/catch boilerplate in every controller and ensuring all async errors reach the central error middleware.
+
+**Q: How does RBAC work in Express?**
+> A middleware factory `requireRole(...roles)` returns a middleware that reads `req.user.role` (set by auth middleware earlier in the chain). If the role isn't in the allowed list, it calls `next(new ApiError(403, ...))` and the request is rejected. The pattern is: authenticate first → authorize second.
+
+**Q: What is the difference between 401 and 403?**
+> 401 Unauthorized: the request lacks valid authentication credentials — you don't know who this is.  
+> 403 Forbidden: the request has valid credentials but this user doesn't have permission — we know who you are, but you can't do this.
+
+**Q: Why separate app.js from server.js?**
+> Tests can import `app` and run requests via Supertest without binding to a port or connecting to a real database. `server.js` handles the runtime concerns (DB connection, port binding). This separation makes integration tests fast and side-effect-free.
+
+---
+
+# PART 6 — WHAT COMES AFTER AUTH
+
+Once auth is working end-to-end, the next layers to build in order:
+
+1. **Member model + CRUD** (the loyalty customers)
+2. **Program model + Tier model** (the loyalty program structure)
+3. **LedgerEntry model** (the append-only point transaction log)
+4. **Earn flow** (POS scans, points calculated, ledger written, member balance updated — all in one transaction)
+5. **Redeem flow** (check balance → write ledger debit → update balance → record redemption — all in one transaction with idempotency key)
+6. **Analytics** (pre-aggregated summaries)
+7. **Billing** (subscription metering + invoicing)
+8. **Background jobs** (tier recompute, expiry, invoicing)
+9. **React frontend**
+
+The auth system you build here is the foundation every one of those layers will depend on. Get it right first.

@@ -1,0 +1,149 @@
+# Website Flow & User Journeys
+### LoyaltyLedger
+
+> The complete navigation map and user journeys. Every page, every primary button, and exactly where it leads. Three surfaces: the **public/marketing** site, the **merchant app** (the main product), and the **platform console** (operator-only).
+
+---
+
+## 1. Page inventory (site map)
+
+```
+PUBLIC
+ ├─ /                     Landing page
+ ├─ /login                Login
+ └─ /register             Register (create business)
+
+MERCHANT APP   (auth required; tenant-scoped; role-gated)
+ ├─ /app                  Dashboard (analytics overview + liability)
+ ├─ /app/members          Members list
+ ├─ /app/members/:id      Member detail (profile + ledger/history)
+ ├─ /app/pos              Counter screen (earn / redeem)   [staff+]
+ ├─ /app/program          Program configuration (earn rule, expiry) [owner/manager]
+ ├─ /app/tiers            Tiers management            [owner/manager]
+ ├─ /app/rewards          Rewards catalog             [owner/manager]
+ ├─ /app/billing          Billing & invoices          [owner]
+ ├─ /app/audit            Audit log viewer            [owner/manager]
+ ├─ /app/team             Staff/user management       [owner]
+ └─ /app/settings         Tenant & account settings
+
+PLATFORM CONSOLE   (PLATFORM_ADMIN only)
+ ├─ /platform             Platform dashboard (cross-tenant metrics)
+ ├─ /platform/tenants     Tenants list
+ └─ /platform/plans       Plans management
+```
+
+---
+
+## 2. Global navigation
+
+**Top bar (all authenticated pages):** product logo (→ `/app` dashboard), tenant/business name, current user menu (→ Settings, Logout).
+
+**Left sidebar (merchant app), filtered by role:**
+- Dashboard → `/app`
+- Members → `/app/members`
+- Counter (POS) → `/app/pos`  *(staff+)*
+- Program → `/app/program`  *(owner/manager)*
+- Tiers → `/app/tiers`  *(owner/manager)*
+- Rewards → `/app/rewards`  *(owner/manager)*
+- Billing → `/app/billing`  *(owner)*
+- Audit → `/app/audit`  *(owner/manager)*
+- Team → `/app/team`  *(owner)*
+- Settings → `/app/settings`
+
+Items the role can't access are hidden from the sidebar **and** blocked server-side (403).
+
+---
+
+## 3. Authentication & routing rules
+
+- Visiting any `/app/*` route **without** a valid token → redirect to `/login`.
+- After successful **login/register** → redirect to `/app` (dashboard). A `PLATFORM_ADMIN` lands on `/platform`.
+- An API `401` (expired access token) triggers a silent refresh via the axios interceptor; if refresh fails → redirect to `/login`.
+- Visiting a role-gated page without the role → redirect to `/app` with a "not authorized" notice.
+
+---
+
+## 4. User journeys (step by step)
+
+### J1 — New merchant signs up (happy path)
+1. Lands on **`/`** (Landing). Sees the pitch and two CTAs: **"Start free"** and **"Live demo."**
+2. Clicks **"Start free"** → navigates to **`/register`**.
+3. Fills business name, name, email, password → clicks **"Create account."**
+4. On success the account (tenant + owner + trial subscription) is created and the user is logged in → redirected to **`/app`** (Dashboard).
+5. Dashboard shows an **empty state** with a guided checklist: *"1. Set your earn rule → 2. Add tiers → 3. Add rewards → 4. Enroll your first member."* Each checklist item is a button to the relevant page.
+6. Clicks **"Set your earn rule"** → **`/app/program`** → saves rule → returns to dashboard (checklist item ticks).
+7. Repeats for **Tiers** (`/app/tiers`) and **Rewards** (`/app/rewards`).
+8. Clicks **"Enroll your first member"** → **`/app/members`** → **"Add member"** → member created.
+9. Goes to **Counter** (`/app/pos`) to record the first transaction.
+
+### J2 — Returning owner reviews the business
+1. **`/login`** → enters credentials → **"Sign in"** → **`/app`**.
+2. Dashboard shows charts: active members, accrual vs redemption, redemption rate, tier distribution, and a prominent **Points Liability** card.
+3. Clicks the **Liability** card → drill-down / `/app/billing` context, or stays for detail.
+4. Sidebar **Billing** → **`/app/billing`** → sees current usage vs plan limits and past **invoices**; clicks an invoice row → invoice detail modal.
+5. Sidebar **Audit** → **`/app/audit`** → filters by action/date to review changes.
+
+### J3 — Cashier processes earn & redeem (the counter)
+1. **`/login`** (staff account) → **`/app`** (limited dashboard) → sidebar **Counter** → **`/app/pos`**.
+2. **Earn:** searches/selects a member by phone (externalRef) → enters purchase amount → clicks **"Add purchase."** System awards points; a toast shows "+5 pts, new balance 120." (Idempotency-Key sent automatically.)
+3. **Redeem:** with the member selected, picks a reward from the catalog → clicks **"Redeem."** If balance is sufficient, points are deducted and a success toast shows; if not, an inline error "Insufficient points" appears.
+4. Clicks the member name → **`/app/members/:id`** to view their full ledger/history.
+
+### J4 — Owner configures the program
+1. Sidebar **Program** → **`/app/program`** → edits earn rule (points per amount, rounding) + expiry policy → **"Save."** (Audited.)
+2. Sidebar **Tiers** → **`/app/tiers`** → **"Add tier"** (name + threshold) → save; edit/remove existing.
+3. Sidebar **Rewards** → **`/app/rewards`** → **"Add reward"** (name + cost) → save; toggle **Active/Inactive** (soft-delete) on existing rewards.
+
+### J5 — Owner makes a manual adjustment
+1. **`/app/members/:id`** → **"Adjust points"** button (visible to owner only) → modal: signed points + reason → **"Apply."**
+2. System writes an `ADJUSTMENT` ledger entry and an audit record; member balance + history update immediately.
+
+### J6 — Owner manages staff
+1. Sidebar **Team** → **`/app/team`** → **"Invite/Add user"** → set name, email, role (manager/staff) → save.
+2. Staff can now log in to the same tenant with their scoped permissions.
+
+### J7 — Platform admin operates the SaaS
+1. **`/login`** (platform admin) → redirected to **`/platform`**.
+2. **`/platform`** dashboard: cross-tenant metrics (tenant count, total members, total liability, revenue).
+3. **Tenants** → **`/platform/tenants`** → list, open a tenant, view/suspend status.
+4. **Plans** → **`/platform/plans`** → create/edit plan tiers (price, included units, overage).
+
+### J8 — Reviewer experiences the demo (portfolio path)
+1. Lands on **`/`** → clicks **"Live demo."**
+2. One-click **"Login as demo merchant"** signs in with seeded credentials → **`/app`** with rich seeded data (populated charts, members, ledger, invoices).
+3. Reviewer explores Counter, Members, Audit, Billing to see a working product in under 90 seconds.
+
+---
+
+## 5. Page-by-page detail (purpose · key elements · buttons → destination)
+
+| Page | Purpose | Key elements | Primary buttons → where |
+|---|---|---|---|
+| `/` Landing | Convert visitors | Pitch, feature highlights, architecture image, Loom | **Start free**→`/register` · **Live demo**→demo login→`/app` · **Login**→`/login` |
+| `/register` | Create business | Form (business, name, email, password) | **Create account**→`/app` · link **Sign in**→`/login` |
+| `/login` | Authenticate | Email, password | **Sign in**→`/app` (or `/platform`) · link **Create account**→`/register` |
+| `/app` Dashboard | Program health | Metric cards, charts, **Liability** card, onboarding checklist (empty state) | checklist items→config pages · **Liability**→detail/Billing |
+| `/app/members` | Manage members | Searchable, paginated list | **Add member**→modal · row→`/app/members/:id` |
+| `/app/members/:id` | Member detail | Profile, balance, **ledger/history** (paginated) | **Adjust points**(owner)→modal · **Redeem**→flow |
+| `/app/pos` Counter | Earn/redeem at counter | Member search, amount input, rewards list | **Add purchase**→accrual · **Redeem**→redemption · member→`/app/members/:id` |
+| `/app/program` | Configure earn rule | Earn rule + expiry form | **Save**→audited update |
+| `/app/tiers` | Manage tiers | Tier list | **Add tier**→modal · edit/remove |
+| `/app/rewards` | Manage catalog | Reward list | **Add reward**→modal · **Active toggle**→soft-delete |
+| `/app/billing` | Usage & invoices | Usage vs plan, invoice list | invoice row→detail · **Change plan**→subscription |
+| `/app/audit` | Accountability | Filterable audit table | filters→query · row→before/after detail |
+| `/app/team` | Staff management | User list | **Add user**→modal (role select) |
+| `/app/settings` | Account/tenant settings | Profile, business info | **Save** |
+| `/platform` | Operate SaaS | Cross-tenant metrics | nav to tenants/plans |
+| `/platform/tenants` | Manage tenants | Tenant list | row→tenant detail · **Suspend** |
+| `/platform/plans` | Manage plans | Plan list | **Add/Edit plan**→modal |
+
+---
+
+## 6. State & edge flows
+
+- **Empty states** (new tenant): dashboard, members, rewards show a guided "add your first…" prompt with a CTA to the right page.
+- **Insufficient points / inactive reward** (redeem): inline error on the counter, no navigation.
+- **Validation errors:** inline field messages; no page change.
+- **Session expiry:** silent token refresh; on hard failure → `/login` with a "session expired" notice.
+- **403 (wrong role):** redirect to `/app` with a non-blocking "not authorized" toast; the link is normally hidden anyway.
+- **Loading:** skeleton placeholders on dashboard/list pages while data loads (progressive render).

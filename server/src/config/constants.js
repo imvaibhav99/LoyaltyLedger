@@ -1,0 +1,14 @@
+export const USER_ROLES = Object.freeze({
+  PLATFORM_ADMIN:   'PLATFORM_ADMIN',
+  MERCHANT_OWNER:   'MERCHANT_OWNER',
+  MERCHANT_MANAGER: 'MERCHANT_MANAGER',
+  MERCHANT_STAFF:   'MERCHANT_STAFF',
+  MEMBER:           'MEMBER',
+});
+
+export const TOKEN_CONFIG = Object.freeze({
+  ACCESS_EXPIRY:  '15m',
+  REFRESH_EXPIRY: '7d',
+});
+
+export const BCRYPT_ROUNDS = 12;

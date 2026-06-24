@@ -104,60 +104,79 @@ The signature is created by running the header + payload through a hashing funct
 
 ---
 
-## 1.4 The Access Token + Refresh Token Pattern
+## 1.4 The Access Token + Refresh Token Pattern — With DB-Backed Refresh Tokens
 
 Here's a core problem: if JWTs are stateless, how do you log someone out? You can't "delete" a token — it's just a string in the client's memory. Once issued, it's valid until it expires.
 
-**The solution:** make access tokens expire very quickly (15 minutes), and use a separate refresh token to get new ones.
+**The naive solution:** make access tokens short-lived (15 min) and use a refresh token (7 days) to get new ones.
+
+**The problem with naive:** if both tokens are pure JWTs verified only cryptographically, you have NO way to revoke a stolen refresh token before its 7-day expiry. Logout is fake — the client forgets the token, but the server will still honor it if an attacker has a copy.
+
+**Our solution:** keep access tokens as pure stateless JWTs (fast, no DB hit per request), but store refresh tokens in the database — hashed.
 
 ```
-ACCESS TOKEN  — expires in 15 minutes
-REFRESH TOKEN — expires in 7 days
+ACCESS TOKEN  — short-lived JWT (15 min), NEVER stored in DB, lives only in client memory
+REFRESH TOKEN — long-lived (7 days), raw token on client, SHA-256 hash stored in DB
 ```
 
-### The flow in practice:
+### The complete flow:
 
 ```
 LOGIN:
   Client sends email + password
-  Server verifies → issues BOTH tokens
-  Client stores both
+  Server verifies password
+  Server signs access token  (JWT, 15min) ← NOT stored anywhere on server
+  Server signs refresh token (JWT, 7 days)
+  Server hashes refresh token with SHA-256 → saves hash to RefreshToken collection
+  Returns both tokens to client
 
-NORMAL REQUESTS (first 15 min):
-  Client sends: Authorization: Bearer <access_token>
-  Server verifies access token → serves request
+NORMAL REQUESTS (while access token is valid):
+  Client: Authorization: Bearer <access_token>
+  Server: verifyAccessToken() → no DB hit → serves request
 
-AFTER 15 MIN:
-  Access token expires
-  Client sends: POST /api/auth/refresh with refresh_token
-  Server verifies refresh token → issues a new access token
-  Client uses new access token for next 15 min
-
-AFTER 7 DAYS:
-  Refresh token expires
-  Client must log in again
+ACCESS TOKEN EXPIRES (after 15 min):
+  Client sends: POST /api/auth/refresh { refreshToken: "..." }
+  Server:
+    1. verifyRefreshToken(raw) → check JWT signature + expiry
+    2. hash(raw) → look up hash in RefreshToken collection
+    3. If not found → token was already used or was revoked → 401 (force re-login)
+    4. If found → DELETE the old record (rotation: one-time use)
+    5. Sign new access token + new refresh token
+    6. Save new refresh token hash to DB
+    7. Return new pair to client
 
 LOGOUT:
-  Client discards both tokens (and optionally server blacklists refresh token)
+  Client sends: POST /api/auth/logout { refreshToken: "..." }
+  Server: hash(raw) → delete from RefreshToken collection
+  Result: even if attacker has a copy, the hash is gone — 401 on next use
+
+ATTACKER STEALS REFRESH TOKEN + USES IT:
+  Attacker calls /refresh with the stolen token
+  Server finds the hash in DB, deletes it, issues new pair
+  Real user's copy of the old token is now gone from DB
+  When real user tries to refresh → hash not found → 401 → forced to re-login
+  (This is token reuse detection — you can optionally nuke ALL sessions for this user here)
 ```
 
-### Why two tokens instead of one long-lived token?
+### Why hash the refresh token before storing it?
 
-If you had one token with 7-day expiry and it was stolen (e.g., XSS attack), the attacker has 7-day access.
+If someone breaches your DB and reads the `RefreshToken` collection, they get only SHA-256 hashes. SHA-256 is not bcrypt (we don't need slowness here — we need speed because every refresh call hashes). The raw tokens are never in the DB. Even a full DB dump gives the attacker nothing usable.
 
-With this pattern:
-- Stolen access token → attacker gets 15 minutes max
-- Stolen refresh token → attacker can get new access tokens, BUT you can detect this with refresh token rotation
+### Why NOT store access tokens in DB?
 
-### Refresh Token Rotation (Advanced — important for interviews)
+Access tokens are verified every single request. If you stored them in DB, every request would require a DB lookup — destroying the stateless scaling advantage of JWTs. 15 minutes is short enough that the risk window is acceptable. The refresh token in DB handles the revocation problem for long-lived sessions.
 
-Every time a refresh token is used, the server:
-1. Invalidates the old refresh token
-2. Issues a brand new refresh token
+### The security model at a glance:
 
-If a stolen refresh token is used by an attacker, and then the real user tries to refresh, the server sees the old (already-used) token → detects a reuse → invalidates the entire session → forces re-login.
+| Threat | Protection |
+|---|---|
+| Stolen access token | 15-minute expiry — max 15min attacker window |
+| Stolen refresh token | Hash in DB → logout deletes it → immediately revoked |
+| DB breach | Only SHA-256 hashes stored — useless without raw tokens |
+| Token reuse (stolen + used) | Rotation detects reuse → old hash gone → real user forced to re-login |
+| Fake/tampered token | JWT signature verification catches it — no DB needed |
 
-**Interview answer:** "Short-lived access tokens minimize the window of damage from token theft. Refresh tokens with rotation allow long sessions while detecting token reuse — if a stolen refresh token is used, the next legitimate use sees it as already-consumed and invalidates the session."
+**Interview answer:** "Access tokens are stateless JWTs verified cryptographically — no DB hit per request. Refresh tokens are stored as SHA-256 hashes in the database. On refresh, we verify the JWT signature AND look up the hash in DB — both must pass. Rotation deletes the hash on use, so reuse is detected. Logout deletes the hash so the token is immediately dead even if stolen. This gives us instant revocation without sacrificing the stateless performance of access tokens."
 
 ---
 
@@ -340,23 +359,25 @@ The DB has a compound unique index `(tenantId, email)` — the same email CAN th
 ## 2.3 JWT Claims Design
 
 ```javascript
-// Access Token payload
+// Access Token payload — embedded in every request, verified statlessly
 {
-  userId:   "64f...",      // User's MongoDB _id
-  tenantId: "65a..." | null,  // null for Platform Admin
-  role:     "MERCHANT_OWNER", // One of the 5 roles
-  iat:      1700000000,    // Issued at
-  exp:      1700000900     // 15 minutes later
+  userId:   "64f...",           // User's MongoDB _id
+  tenantId: "65a..." | null,    // null for Platform Admin
+  role:     "MERCHANT_OWNER",   // One of the 5 roles
+  iat:      1700000000,         // Issued at (auto-added by jsonwebtoken)
+  exp:      1700000900          // 15 minutes later (auto-added)
 }
 
-// Refresh Token payload (minimal — just enough to find the user)
+// Refresh Token payload — minimal; real authority is the DB record, not this JWT
 {
-  userId:   "64f...",
-  tokenVersion: 1,         // For rotation/invalidation
+  userId:   "64f...",   // Just enough to identify the user when we look up the DB record
   iat:      1700000000,
-  exp:      1700604800     // 7 days later
+  exp:      1700604800  // 7 days later
 }
 ```
+
+**Why is the refresh token payload so minimal?**
+The JWT signature + expiry provides the first line of defence (tamper-proof, can't be forged). The DB record (`RefreshToken` collection) provides the second line (revocable, one-time-use). We don't need to embed `tenantId` or `role` in the refresh token payload — when it's used, we re-fetch the user from DB to get the freshest data, then embed it in the new access token.
 
 ---
 
@@ -398,25 +419,27 @@ Incoming Request
 ## 2.5 Files You Need to Create (Implementation Roadmap)
 
 ```
-Step 1: server/src/config/constants.js       ← Role constants, token config
-Step 2: server/src/config/env.js             ← Environment variable validation
-Step 3: server/src/config/db.js              ← MongoDB connection
-Step 4: server/src/models/Tenant.js          ← Tenant schema
-Step 5: server/src/models/User.js            ← Fix existing bugs + complete it
-Step 6: server/src/utils/ApiError.js         ← Custom error class
-Step 7: server/src/utils/asyncHandler.js     ← Wraps async controllers
-Step 8: server/src/utils/token.js            ← JWT sign/verify helpers
-Step 9: server/src/services/authService.js   ← Login, signup, refresh logic
-Step 10: server/src/controllers/authController.js  ← Thin HTTP handlers
-Step 11: server/src/middleware/auth.js        ← verifyToken middleware
-Step 12: server/src/middleware/rbac.js        ← requireRole factory
-Step 13: server/src/middleware/error.js       ← Central error handler
-Step 14: server/src/validators/authValidator.js ← zod schemas
-Step 15: server/src/routes/auth.js            ← /api/auth/* routes
-Step 16: server/src/routes/index.js           ← Root router
-Step 17: server/src/app.js                    ← Express app setup
-Step 18: server/src/server.js                 ← DB connect + listen
-Step 19: scripts/seedAdmin.js                 ← Create your Platform Admin account
+Step 1:  server/src/config/constants.js          ← Role constants, token config
+Step 2:  server/src/config/env.js                ← Environment variable validation
+Step 3:  server/src/config/db.js                 ← MongoDB connection
+Step 4:  server/src/models/Tenant.js             ← Tenant schema
+Step 5:  server/src/models/User.js               ← Fix existing bugs + complete it
+Step 6:  server/src/models/RefreshToken.js       ← DB-backed refresh token store (NEW)
+Step 7:  server/src/utils/ApiError.js            ← Custom error class
+Step 8:  server/src/utils/asyncHandler.js        ← Wraps async controllers
+Step 9:  server/src/utils/token.js               ← JWT sign/verify + hashToken helper (UPDATED)
+Step 10: server/src/services/authService.js      ← Login, signup, refresh, logout (UPDATED)
+Step 11: server/src/controllers/authController.js ← Thin HTTP handlers (+ logout endpoint)
+Step 12: server/src/middleware/auth.js            ← verifyToken middleware
+Step 13: server/src/middleware/rbac.js            ← requireRole factory
+Step 14: server/src/middleware/error.js           ← Central error handler
+Step 15: server/src/validators/authValidator.js  ← zod schemas
+Step 16: server/src/middleware/validate.js        ← zod middleware wrapper
+Step 17: server/src/routes/auth.js               ← /api/auth/* routes (+ POST /logout)
+Step 18: server/src/routes/index.js              ← Root router
+Step 19: server/src/app.js                       ← Express app setup
+Step 20: server/src/server.js                    ← DB connect + listen
+Step 21: scripts/seedAdmin.js                    ← Create your Platform Admin account
 ```
 
 ---
@@ -534,13 +557,30 @@ Run it twice — one for ACCESS_SECRET, one for REFRESH_SECRET. They must be dif
 import mongoose from 'mongoose';
 import { env } from './env.js';
 
+const MAX_RETRIES   = 5;
+const RETRY_DELAY   = 3000;
+
 export async function connectDB() {
-  const conn = await mongoose.connect(env.MONGODB_URI);
-  console.log(`MongoDB connected: ${conn.connection.host}`);
+  let attempt = 0;
+  while (attempt < MAX_RETRIES) {
+    try {
+      const conn = await mongoose.connect(env.MONGODB_URI);
+      console.log(`MongoDB connected: ${conn.connection.host}`);
+      return;
+    } catch (err) {
+      attempt++;
+      if (attempt >= MAX_RETRIES) {
+        console.error(`MongoDB failed after ${MAX_RETRIES} attempts.`);
+        throw err;
+      }
+      console.warn(`Connection attempt ${attempt} failed. Retrying in ${RETRY_DELAY / 1000}s...`);
+      await new Promise((r) => setTimeout(r, RETRY_DELAY));
+    }
+  }
 }
 ```
 
-**Concept:** We export a function, not a side-effect. `server.js` will call `connectDB()` before `app.listen()`. This ensures we never accept HTTP requests while the DB is still connecting.
+**Concept:** We export a function, not a side-effect. `server.js` will call `connectDB()` before `app.listen()`. This ensures we never accept HTTP requests while the DB is still connecting. Retry logic handles transient Atlas connectivity issues on startup.
 
 ---
 
@@ -678,7 +718,56 @@ export const User = mongoose.model('User', userSchema);
 
 ---
 
-## STEP 6 — `server/src/utils/ApiError.js`
+## STEP 6 — `server/src/models/RefreshToken.js` (NEW)
+
+This is the model that gives us full control over sessions. One document per active session.
+
+```javascript
+import mongoose from 'mongoose';
+
+const refreshTokenSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+    },
+    tokenHash: {
+      type: String,
+      required: true,
+      unique: true,   // no two records with the same hash
+    },
+    expiresAt: {
+      type: Date,
+      required: true,
+    },
+  },
+  { timestamps: true }
+);
+
+// TTL index: MongoDB automatically deletes the document once expiresAt passes
+// This means expired sessions clean themselves up — no cron job needed
+refreshTokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
+// Fast lookup when a user logs out of ALL devices
+refreshTokenSchema.index({ userId: 1 });
+
+const RefreshToken = mongoose.model('RefreshToken', refreshTokenSchema);
+export default RefreshToken;
+```
+
+**Why `tokenHash` and not the raw token?**
+If your database is ever breached, the attacker gets only SHA-256 hashes. They cannot reverse a SHA-256 hash to get the original token. The raw token only ever lives on the client and in transit — never at rest on the server.
+
+**Why TTL index instead of a cron job?**
+MongoDB's TTL index automatically deletes documents when `expiresAt` is in the past. This means 7-day-old sessions evaporate on their own. Zero maintenance.
+
+**Why `userId` index?**
+When a user changes their password or you want to log them out of all devices, you do `RefreshToken.deleteMany({ userId })`. Without the index this would be a full collection scan.
+
+---
+
+## STEP 7 — `server/src/utils/ApiError.js`
 
 ```javascript
 export class ApiError extends Error {
@@ -739,10 +828,11 @@ export const loginController = asyncHandler(async (req, res) => {
 
 ---
 
-## STEP 8 — `server/src/utils/token.js`
+## STEP 9 — `server/src/utils/token.js` (UPDATED — adds hashToken)
 
 ```javascript
 import jwt from 'jsonwebtoken';
+import crypto from 'node:crypto';
 import { env } from '../config/env.js';
 import { TOKEN_CONFIG } from '../config/constants.js';
 
@@ -759,143 +849,209 @@ export function signRefreshToken(payload) {
 }
 
 export function verifyAccessToken(token) {
-  // jwt.verify throws if token is invalid or expired — let it bubble up
+  // jwt.verify throws if token is invalid or expired — let it bubble up to auth middleware
   return jwt.verify(token, env.JWT_ACCESS_SECRET);
 }
 
 export function verifyRefreshToken(token) {
   return jwt.verify(token, env.JWT_REFRESH_SECRET);
 }
+
+// Hash a raw refresh token before storing/looking it up in the DB.
+// SHA-256 is fast (good — called on every refresh/logout) and one-way (good — DB breach safety).
+// NOT bcrypt — bcrypt's slowness is for passwords (brute-force resistance). 
+// Refresh tokens are long random strings, not guessable — speed is fine here.
+export function hashToken(rawToken) {
+  return crypto.createHash('sha256').update(rawToken).digest('hex');
+}
 ```
 
-**Concept:** We use TWO different secrets for access and refresh tokens. Why? So a stolen refresh secret doesn't also compromise access token verification, and vice versa. Defense in depth.
+**Why two different secrets for access and refresh tokens?**
+If the same secret was used for both, a vulnerability that exposes the access secret would also let an attacker forge refresh tokens (7-day lifetime). Separate secrets = separate blast radius.
 
 **What `jwt.verify` does:**
 1. Splits the token into header + payload + signature
 2. Recomputes the signature using the secret
-3. Compares — if it doesn't match, throws `JsonWebTokenError`
-4. Checks expiry — if expired, throws `TokenExpiredError`
-5. If everything is fine, returns the decoded payload
+3. If it doesn't match → throws `JsonWebTokenError`
+4. Checks expiry → if expired → throws `TokenExpiredError`
+5. If everything is fine → returns decoded payload
 
 ---
 
-## STEP 9 — `server/src/services/authService.js`
+## STEP 10 — `server/src/services/authService.js` (UPDATED — DB-backed refresh tokens)
 
 This is the brain of authentication. All logic lives here. No `req` or `res` — just data in, data out.
 
 ```javascript
 import mongoose from 'mongoose';
-import { User } from '../models/User.js';
-import { Tenant } from '../models/Tenant.js';
-import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../utils/token.js';
+import User from '../models/User.js';
+import Tenant from '../models/Tenant.js';
+import RefreshToken from '../models/RefreshToken.js';
+import { signAccessToken, signRefreshToken, verifyRefreshToken, hashToken } from '../utils/token.js';
 import { ApiError } from '../utils/ApiError.js';
-import { USER_ROLES } from '../config/constants.js';
+import { USER_ROLES, TOKEN_CONFIG } from '../config/constants.js';
 
-// ─── HELPER ────────────────────────────────────────────────────────────────
-
-function buildTokens(user) {
-  const accessPayload  = { userId: user.id, tenantId: user.tenantId, role: user.role };
-  const refreshPayload = { userId: user.id };
-  return {
-    accessToken:  signAccessToken(accessPayload),
-    refreshToken: signRefreshToken(refreshPayload),
-  };
+// ─── HELPER: calculate expiry date for the refresh token DB record ──────────
+// Must match TOKEN_CONFIG.REFRESH_EXPIRY ('7d') exactly
+function refreshExpiresAt() {
+  return new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days from now
 }
 
-// ─── LOGIN (Platform Admin + All Tenant Users — same endpoint) ─────────────
+// ─── HELPER: sign both tokens + persist refresh token hash in DB ────────────
+async function issueTokens(user, session = null) {
+  const accessPayload  = { userId: user._id, tenantId: user.tenantId, role: user.role };
+  const refreshPayload = { userId: user._id };
+
+  const accessToken  = signAccessToken(accessPayload);
+  const refreshToken = signRefreshToken(refreshPayload);
+  const tokenHash    = hashToken(refreshToken);
+
+  const record = {
+    userId:    user._id,
+    tokenHash,
+    expiresAt: refreshExpiresAt(),
+  };
+
+  // If we're inside a transaction (signup), save the refresh token inside it
+  if (session) {
+    await RefreshToken.create([record], { session });
+  } else {
+    await RefreshToken.create(record);
+  }
+
+  return { accessToken, refreshToken };
+}
+
+// ─── LOGIN ──────────────────────────────────────────────────────────────────
 
 export async function login({ email, password }) {
-  // 1. Find user by email. We need passwordHash, so .select('+passwordHash')
-  const user = await User.findOne({ email }).select('+passwordHash');
+  // 1. Find user by email — need passwordHash, so .select('+passwordHash')
+  const user = await User.findOne({ email: email.toLowerCase() }).select('+passwordHash');
 
-  // 2. Generic error — never reveal whether the email exists or the password is wrong.
-  //    Both cases return the same message. This prevents user enumeration attacks.
+  // 2. Generic error — never reveal whether email exists or password is wrong.
+  //    Both cases return identical message. Prevents user enumeration attacks.
   if (!user) throw new ApiError(401, 'Invalid credentials');
 
-  // 3. Verify password
   const valid = await user.verifyPassword(password);
   if (!valid) throw new ApiError(401, 'Invalid credentials');
 
-  // 4. Issue tokens
-  const tokens = buildTokens(user);
+  // 3. Issue tokens and save refresh token hash to DB
+  const tokens = await issueTokens(user);
 
+  // Return user without passwordHash (toJSON transform handles this)
   return { user, ...tokens };
 }
 
-// ─── MERCHANT SIGNUP ───────────────────────────────────────────────────────
+// ─── MERCHANT SIGNUP ────────────────────────────────────────────────────────
 
 export async function signup({ businessName, ownerName, email, password, plan }) {
-  // Check for existing email before starting transaction (faster fail path)
-  const existing = await User.findOne({ email });
+  // Fast fail before starting transaction
+  const existing = await User.findOne({ email: email.toLowerCase() });
   if (existing) throw new ApiError(409, 'An account with this email already exists');
 
-  // MongoDB multi-document transaction
   const session = await mongoose.startSession();
-  session.startTransaction();
-
   try {
-    // Generate slug from businessName: "Zest Cafe" → "zest-cafe"
-    const slug = businessName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+    let result;
+    await session.withTransaction(async () => {
+      const slug = businessName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
 
-    // Check slug uniqueness
-    const existingTenant = await Tenant.findOne({ slug }).session(session);
-    if (existingTenant) throw new ApiError(409, 'Business name already taken');
+      const existingTenant = await Tenant.findOne({ slug }).session(session);
+      if (existingTenant) throw new ApiError(409, 'Business name already taken');
 
-    // Create Tenant (array form required for sessions with .create())
-    const [tenant] = await Tenant.create(
-      [{ businessName, slug, plan: plan || 'starter', billingEmail: email }],
-      { session }
-    );
+      const [tenant] = await Tenant.create(
+        [{ businessName, slug, plan: plan || 'starter', billingEmail: email }],
+        { session }
+      );
 
-    // Create User (as MERCHANT_OWNER of the new tenant)
-    const [user] = await User.create(
-      [{ tenantId: tenant._id, name: ownerName, email, role: USER_ROLES.MERCHANT_OWNER }],
-      { session }
-    );
+      const [user] = await User.create(
+        [{ tenantId: tenant._id, name: ownerName, email: email.toLowerCase(), role: USER_ROLES.MERCHANT_OWNER }],
+        { session }
+      );
 
-    // Hash password and save (we can't use pre-save hook easily in transactions)
-    await user.setPassword(password);
-    await user.save({ session });
+      await user.setPassword(password);
+      await user.save({ session });
 
-    await session.commitTransaction();
+      // Refresh token record created inside the same transaction
+      // If anything fails, the RefreshToken record is also rolled back
+      const tokens = await issueTokens(user, session);
 
-    const tokens = buildTokens(user);
-    return { user, tenant, ...tokens };
-
-  } catch (err) {
-    await session.abortTransaction();
-    throw err;  // Re-throw so asyncHandler → error middleware handles it
+      result = { user, tenant, ...tokens };
+    });
+    return result;
   } finally {
-    session.endSession();
+    await session.endSession();
   }
 }
 
-// ─── REFRESH TOKENS ────────────────────────────────────────────────────────
+// ─── REFRESH ─────────────────────────────────────────────────────────────────
 
-export async function refresh(refreshToken) {
-  if (!refreshToken) throw new ApiError(401, 'Refresh token required');
+export async function refresh(rawRefreshToken) {
+  if (!rawRefreshToken) throw new ApiError(401, 'Refresh token required');
 
+  // Step 1: Verify the JWT signature and expiry
+  // If forged or expired → throws → caught by asyncHandler → 401
   let payload;
   try {
-    payload = verifyRefreshToken(refreshToken);
+    payload = verifyRefreshToken(rawRefreshToken);
   } catch {
     throw new ApiError(401, 'Invalid or expired refresh token');
   }
 
-  // Fetch user to get latest role/tenantId (in case they changed since token was issued)
+  // Step 2: Look up the hash in the DB — proves this exact token was issued by us
+  const tokenHash = hashToken(rawRefreshToken);
+  const stored    = await RefreshToken.findOne({ tokenHash });
+
+  if (!stored) {
+    // Token was already used (rotation) or was explicitly revoked (logout)
+    // Could also mean an attacker is replaying a stolen token after the real user refreshed
+    // Option: also nuke ALL sessions for this user here for maximum security:
+    // await RefreshToken.deleteMany({ userId: payload.userId });
+    throw new ApiError(401, 'Refresh token not recognised — please log in again');
+  }
+
+  // Step 3: Fetch fresh user data — roles/tenantId may have changed since the token was issued
   const user = await User.findById(payload.userId);
   if (!user) throw new ApiError(401, 'User no longer exists');
 
-  const tokens = buildTokens(user);
+  // Step 4: ROTATION — delete the old record so this token can never be used again
+  await RefreshToken.deleteOne({ _id: stored._id });
+
+  // Step 5: Issue a brand new pair and persist the new hash
+  const tokens = await issueTokens(user);
   return tokens;
+}
+
+// ─── LOGOUT ──────────────────────────────────────────────────────────────────
+
+export async function logout(rawRefreshToken) {
+  if (!rawRefreshToken) return; // Already logged out — idempotent
+  const tokenHash = hashToken(rawRefreshToken);
+  await RefreshToken.deleteOne({ tokenHash });
+  // No error if not found — idempotent logout
+}
+
+// ─── LOGOUT ALL DEVICES ───────────────────────────────────────────────────────
+
+export async function logoutAll(userId) {
+  await RefreshToken.deleteMany({ userId });
 }
 ```
 
-**Concept — Why re-fetch user on refresh?** If you change a user's role (e.g., promote staff to manager), the old access token still has the old role for up to 15 minutes. That's acceptable — it's the intentional trade-off of JWTs. But the refresh flow gives us a chance to embed the freshest data. So on refresh, we always query the DB for the current user state.
+**Key concepts in this implementation:**
+
+**`issueTokens` persists inside a transaction (signup):** When a merchant signs up, we create Tenant + User + RefreshToken in one atomic transaction. If User creation fails, the RefreshToken record is also rolled back. No orphaned sessions.
+
+**`refresh` is two-factor:** JWT verification (cryptographic) AND DB lookup (revocability). Both must pass. This is why this pattern is far stronger than JWT-only refresh.
+
+**Rotation in `refresh`:** We `deleteOne` before creating the new record. Even if the response never reaches the client (network error), the old token is gone. The client can simply call `/auth/login` again. This is the safe trade-off.
+
+**`logout` is idempotent:** If the client calls logout twice (e.g., network retry), the second call finds no record and does nothing. No error. This is correct behaviour.
+
+**Why re-fetch user on refresh?** If you promote a staff member to manager, their old access token has the old role for up to 15 minutes. That's acceptable. But when they refresh, we re-query the DB for the current role — the new access token will have the updated role. This keeps data consistent without real-time token invalidation.
 
 ---
 
-## STEP 10 — `server/src/controllers/authController.js`
+## STEP 11 — `server/src/controllers/authController.js` (UPDATED — adds logout)
 
 Thin handlers. No logic. Read req → call service → write res.
 
@@ -920,13 +1076,24 @@ export const signup = asyncHandler(async (req, res) => {
 });
 
 export const refresh = asyncHandler(async (req, res) => {
-  const { refreshToken } = req.body;
-  const tokens = await authService.refresh(refreshToken);
+  const tokens = await authService.refresh(req.body.refreshToken);
   res.status(200).json({ success: true, data: tokens });
 });
 
+export const logout = asyncHandler(async (req, res) => {
+  // Delete this session's refresh token from DB
+  await authService.logout(req.body.refreshToken);
+  res.status(200).json({ success: true, message: 'Logged out successfully' });
+});
+
+export const logoutAll = asyncHandler(async (req, res) => {
+  // Delete ALL sessions for this user (requires valid access token — uses req.user)
+  await authService.logoutAll(req.user.userId);
+  res.status(200).json({ success: true, message: 'Logged out from all devices' });
+});
+
 export const me = asyncHandler(async (req, res) => {
-  // req.user is set by auth middleware. This endpoint just returns it.
+  // req.user is set by auth middleware
   res.status(200).json({ success: true, data: { user: req.user } });
 });
 ```
@@ -1087,7 +1254,7 @@ export function validate(schema) {
 
 ---
 
-## STEP 16 — `server/src/routes/auth.js`
+## STEP 17 — `server/src/routes/auth.js` (UPDATED — adds logout routes)
 
 ```javascript
 import { Router } from 'express';
@@ -1099,19 +1266,28 @@ import { loginSchema, signupSchema, refreshSchema } from '../validators/authVali
 const router = Router();
 
 // POST /api/auth/login
-router.post('/login', validate(loginSchema), authController.login);
+router.post('/login',   validate(loginSchema),   authController.login);
 
 // POST /api/auth/signup
-router.post('/signup', validate(signupSchema), authController.signup);
+router.post('/signup',  validate(signupSchema),  authController.signup);
 
-// POST /api/auth/refresh
+// POST /api/auth/refresh — rotates refresh token (old hash deleted, new hash saved)
 router.post('/refresh', validate(refreshSchema), authController.refresh);
 
-// GET /api/auth/me  (protected — requires valid access token)
+// POST /api/auth/logout — deletes this session's refresh token from DB
+// Client sends the refresh token in body so we can hash + delete it
+router.post('/logout',  validate(refreshSchema), authController.logout);
+
+// POST /api/auth/logout-all — deletes ALL sessions for this user (requires access token)
+router.post('/logout-all', authenticate, authController.logoutAll);
+
+// GET /api/auth/me — returns current user from access token
 router.get('/me', authenticate, authController.me);
 
 export default router;
 ```
+
+**Design note on logout:** The client sends the refresh token in the logout request body so the server can hash it and delete that specific record. The access token is NOT sent — it doesn't need to be, because it will expire on its own in max 15 minutes. This is the correct, pragmatic trade-off for stateless access tokens.
 
 ---
 
@@ -1259,7 +1435,7 @@ Run with: `npm run seed`
 
 # PART 4 — TESTING YOUR AUTH SYSTEM
 
-Once everything is wired up, test in this order using a REST client (Postman, Insomnia, or `curl`):
+Once everything is wired up, test in this order. Each test has an expected result — verify before moving to the next.
 
 ```bash
 # 1. Start the server
@@ -1268,24 +1444,64 @@ npm run dev
 # 2. Seed the admin
 npm run seed
 
-# 3. Test Platform Admin login
+# 3. Admin login — check Atlas: RefreshToken collection should have 1 document
 curl -X POST http://localhost:5000/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email": "info@monilcorpus.com", "password": "ChangeThisPassword123!"}'
+  -d '{"email":"info@monilcorpus.com","password":"ChangeThisPassword123!"}'
+# Expected: { success: true, data: { user, accessToken, refreshToken } }
+# Check Atlas: db.refreshtokens.find() → 1 document with tokenHash
 
-# 4. Test Merchant Signup
+# 4. Merchant signup
 curl -X POST http://localhost:5000/api/auth/signup \
   -H "Content-Type: application/json" \
   -d '{"businessName":"Zest Cafe","ownerName":"Raj Kumar","email":"raj@zestcafe.com","password":"SecurePass123!"}'
+# Expected: 201 with tenant + tokens
+# Check Atlas: 1 Tenant doc + 1 User doc + 1 RefreshToken doc (all created atomically)
 
-# 5. Test protected route — use the accessToken from step 3 or 4
+# 5. Protected route — use accessToken from step 3 or 4
+ACCESS="<paste_access_token>"
 curl -X GET http://localhost:5000/api/auth/me \
-  -H "Authorization: Bearer <paste_access_token_here>"
+  -H "Authorization: Bearer $ACCESS"
+# Expected: 200 with user object
 
-# 6. Test token refresh
+# 6. Refresh — old hash deleted, new hash saved in DB
+REFRESH="<paste_refresh_token>"
 curl -X POST http://localhost:5000/api/auth/refresh \
   -H "Content-Type: application/json" \
-  -d '{"refreshToken": "<paste_refresh_token_here>"}'
+  -d "{\"refreshToken\":\"$REFRESH\"}"
+# Expected: 200 with NEW accessToken and NEW refreshToken
+# Check Atlas: old tokenHash is gone, new tokenHash exists
+
+# 7. Try to use the OLD refresh token again (rotation test)
+curl -X POST http://localhost:5000/api/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d "{\"refreshToken\":\"$REFRESH\"}"
+# Expected: 401 "Refresh token not recognised" — old token is dead
+
+# 8. Logout — hash deleted from DB
+NEW_REFRESH="<paste new refreshToken from step 6>"
+curl -X POST http://localhost:5000/api/auth/logout \
+  -H "Content-Type: application/json" \
+  -d "{\"refreshToken\":\"$NEW_REFRESH\"}"
+# Expected: 200 "Logged out successfully"
+# Check Atlas: RefreshToken collection has 0 documents for this user
+
+# 9. Try to use the logged-out refresh token
+curl -X POST http://localhost:5000/api/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d "{\"refreshToken\":\"$NEW_REFRESH\"}"
+# Expected: 401 — token is dead, even if JWT expiry hasn't passed yet
+# THIS IS THE POWER OF DB-BACKED REFRESH TOKENS
+
+# 10. No token → 401
+curl http://localhost:5000/api/auth/me
+# Expected: 401 "No token provided"
+
+# 11. Bad credentials → 401 (same message whether email or password is wrong)
+curl -X POST http://localhost:5000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"wrong@email.com","password":"wrongpass"}'
+# Expected: 401 "Invalid credentials"
 ```
 
 ---
@@ -1296,7 +1512,13 @@ curl -X POST http://localhost:5000/api/auth/refresh \
 > A JWT is a stateless token with three parts: header (algo), payload (claims), signature. The signature is an HMAC hash of header+payload using a server secret. Any modification to the payload invalidates the signature. The server can verify tokens without a DB lookup — enabling stateless, horizontally scalable auth.
 
 **Q: Why access token + refresh token?**
-> Short-lived access tokens (15min) minimize damage from token theft. Refresh tokens (7 days) maintain long sessions. Refresh token rotation detects stolen tokens by flagging reuse of an already-consumed token.
+> Short-lived access tokens (15min) minimize the window of damage from theft — stateless, no DB hit per request. Refresh tokens (7 days) maintain long sessions and are stored as SHA-256 hashes in DB, giving us full revocation control. Rotation detects stolen tokens — if a stolen token is used, the hash is consumed, and the real user's next refresh detects reuse.
+
+**Q: Where do you store the refresh token and why?**
+> The raw refresh token is sent to the client and stored in memory or secure storage. On the server, we store only a SHA-256 hash of it in the `RefreshToken` collection. This means a DB breach gives an attacker only hashes — useless without the raw tokens. Access tokens are never stored anywhere on the server — they're verified purely cryptographically on every request.
+
+**Q: How do you implement logout with JWTs?**
+> Access tokens are stateless — you can't truly revoke them before expiry. We accept this: they're short-lived (15min), so the risk window is small. For refresh tokens, logout deletes the hash from DB. Even if the attacker has a copy of the raw token, the hash is gone and the next refresh call returns 401. True session termination happens at the refresh token level.
 
 **Q: Why bcrypt and not SHA-256?**
 > SHA-256 is fast — attackers can compute billions of hashes/second. bcrypt is intentionally slow (configurable cost factor) and automatically salts the password, making brute-force and rainbow table attacks impractical.

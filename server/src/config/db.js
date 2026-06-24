@@ -1,7 +1,7 @@
 import mongoose from 'mongoose';
 import { env } from './env.js';
 
-const MAX_RETRIES = 5;
+const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 3000;
 
 export async function connectDB() {

@@ -4,6 +4,7 @@ import cors from 'cors';
 import morgan from 'morgan';
 import rateLimit from 'express-rate-limit';
 import { env } from './config/env.js';
+import router from './routes/index.js';
 import { errorMiddleware } from './middleware/error.js';
 
 const app = express();
@@ -24,8 +25,7 @@ app.use(
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-// import router from './routes/index.js';
-// app.use('/api', router);
+app.use('/api', router);
 
 app.use(errorMiddleware);
 

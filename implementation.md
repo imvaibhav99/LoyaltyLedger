@@ -393,115 +393,160 @@ export const refreshSchema = z.object({
 
 ### Step 3.5 — `server/src/services/authService.js`
 
+> **Pattern:** `class` + `static` arrow functions + `export default`. See CLAUDE.md.
+
 ```javascript
 import mongoose from 'mongoose';
-import bcrypt from 'bcryptjs';
-import Tenant from '../models/Tenant.js';
 import User from '../models/User.js';
-import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../utils/token.js';
+import Tenant from '../models/Tenant.js';
+import RefreshToken from '../models/RefreshToken.js';
+import { signAccessToken, signRefreshToken, verifyRefreshToken, hashToken } from '../utils/token.js';
 import { ApiError } from '../utils/ApiError.js';
+import { USER_ROLES } from '../config/constants.js';
 
-function buildTokens(user, tenantId) {
-  const payload = { userId: user._id, tenantId, role: user.role };
-  return {
-    accessToken:  signAccessToken(payload),
-    refreshToken: signRefreshToken(payload),
+const refreshExpiresAt = () => new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+const issueTokens = async (user, session = null) => {
+  const accessPayload  = { userId: user._id, tenantId: user.tenantId, role: user.role };
+  const refreshPayload = { userId: user._id };
+  const accessToken    = signAccessToken(accessPayload);
+  const refreshToken   = signRefreshToken(refreshPayload);
+  const tokenHash      = hashToken(refreshToken);
+  const record = { userId: user._id, tokenHash, expiresAt: refreshExpiresAt() };
+  if (session) await RefreshToken.create([record], { session });
+  else         await RefreshToken.create(record);
+  return { accessToken, refreshToken };
+};
+
+class AuthService {
+
+  static login = async ({ email, password }) => {
+    const user = await User.findOne({ email: email.toLowerCase() }).select('+passwordHash');
+    if (!user) throw new ApiError(401, 'Invalid credentials');
+    const valid = await user.verifyPassword(password);
+    if (!valid) throw new ApiError(401, 'Invalid credentials');
+    const tokens = await issueTokens(user);
+    return { user, ...tokens };
   };
+
+  static signup = async ({ businessName, ownerName, email, password, plan }) => {
+    const existing = await User.findOne({ email: email.toLowerCase() });
+    if (existing) throw new ApiError(409, 'An account with this email already exists');
+    const session = await mongoose.startSession();
+    try {
+      let result;
+      await session.withTransaction(async () => {
+        const slug = businessName.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+        const existingTenant = await Tenant.findOne({ slug }).session(session);
+        if (existingTenant) throw new ApiError(409, 'Business name already taken');
+        const [tenant] = await Tenant.create(
+          [{ businessName, slug, plan: plan || 'starter', billingEmail: email.toLowerCase() }],
+          { session }
+        );
+        const [user] = await User.create(
+          [{ tenantId: tenant._id, name: ownerName, email: email.toLowerCase(), role: USER_ROLES.MERCHANT_OWNER }],
+          { session }
+        );
+        await user.setPassword(password);
+        await user.save({ session });
+        const tokens = await issueTokens(user, session);
+        result = { user, tenant, ...tokens };
+      });
+      return result;
+    } finally {
+      await session.endSession();
+    }
+  };
+
+  static refresh = async (rawRefreshToken) => {
+    if (!rawRefreshToken) throw new ApiError(401, 'Refresh token required');
+    let payload;
+    try { payload = verifyRefreshToken(rawRefreshToken); }
+    catch { throw new ApiError(401, 'Invalid or expired refresh token'); }
+    const tokenHash = hashToken(rawRefreshToken);
+    const stored    = await RefreshToken.findOne({ tokenHash });
+    if (!stored) throw new ApiError(401, 'Refresh token not recognised — please log in again');
+    const user = await User.findById(payload.userId);
+    if (!user) throw new ApiError(401, 'User no longer exists');
+    await RefreshToken.deleteOne({ _id: stored._id });
+    return issueTokens(user);
+  };
+
+  static logout = async (rawRefreshToken) => {
+    if (!rawRefreshToken) return;
+    const tokenHash = hashToken(rawRefreshToken);
+    await RefreshToken.deleteOne({ tokenHash });
+  };
+
+  static logoutAll = async (userId) => {
+    await RefreshToken.deleteMany({ userId });
+  };
+
 }
 
-export async function login({ email, password }) {
-  const user = await User.findOne({ email: email.toLowerCase() }).select('+passwordHash');
-  if (!user) throw new ApiError(401, 'Invalid credentials');
-  const match = await bcrypt.compare(password, user.passwordHash);
-  if (!match) throw new ApiError(401, 'Invalid credentials');
-  const tokens = buildTokens(user, user.tenantId);
-  const safe = user.toObject();
-  delete safe.passwordHash;
-  return { user: safe, ...tokens };
-}
-
-export async function signup({ businessName, ownerName, email, password }) {
-  const session = await mongoose.startSession();
-  try {
-    let result;
-    await session.withTransaction(async () => {
-      const existing = await User.findOne({ email: email.toLowerCase() }).session(session);
-      if (existing) throw new ApiError(409, 'Email already in use');
-      const [tenant] = await Tenant.create([{ name: businessName }], { session });
-      const hash = await bcrypt.hash(password, 12);
-      const [user] = await User.create([{
-        tenantId:     tenant._id,
-        name:         ownerName,
-        email:        email.toLowerCase(),
-        passwordHash: hash,
-        role:         'MERCHANT_OWNER',
-      }], { session });
-      const tokens = buildTokens(user, tenant._id);
-      const safe = user.toObject();
-      delete safe.passwordHash;
-      result = { user: safe, tenant, ...tokens };
-    });
-    return result;
-  } finally {
-    await session.endSession();
-  }
-}
-
-export async function refresh(refreshToken) {
-  let payload;
-  try {
-    payload = verifyRefreshToken(refreshToken);
-  } catch {
-    throw new ApiError(401, 'Invalid or expired refresh token');
-  }
-  const tokens = buildTokens({ _id: payload.userId, role: payload.role }, payload.tenantId);
-  return tokens;
-}
+export default AuthService;
 ```
 
 ### Step 3.6 — `server/src/controllers/authController.js`
 
+> **Pattern:** `class` + `static` arrow functions + `export default`. See CLAUDE.md.
+
 ```javascript
 import { asyncHandler } from '../utils/asyncHandler.js';
-import * as authService from '../services/authService.js';
-import User from '../models/User.js';
+import AuthService from '../services/authService.js';
 
-export const login = asyncHandler(async (req, res) => {
-  const data = await authService.login(req.body);
-  res.json({ success: true, data });
-});
+class AuthController {
 
-export const signup = asyncHandler(async (req, res) => {
-  const data = await authService.signup(req.body);
-  res.status(201).json({ success: true, data });
-});
+  static login = asyncHandler(async (req, res) => {
+    const { user, accessToken, refreshToken } = await AuthService.login(req.body);
+    res.status(200).json({ success: true, data: { user, accessToken, refreshToken } });
+  });
 
-export const refresh = asyncHandler(async (req, res) => {
-  const data = await authService.refresh(req.body.refreshToken);
-  res.json({ success: true, data });
-});
+  static signup = asyncHandler(async (req, res) => {
+    const { user, tenant, accessToken, refreshToken } = await AuthService.signup(req.body);
+    res.status(201).json({ success: true, data: { user, tenant, accessToken, refreshToken } });
+  });
 
-export const me = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.user.userId).populate('roleId');
-  if (!user) throw new ApiError(401, 'User not found');
-  res.json({ success: true, data: { user } });
-});
+  static refresh = asyncHandler(async (req, res) => {
+    const tokens = await AuthService.refresh(req.body.refreshToken);
+    res.status(200).json({ success: true, data: tokens });
+  });
+
+  static logout = asyncHandler(async (req, res) => {
+    await AuthService.logout(req.body.refreshToken);
+    res.status(200).json({ success: true, message: 'Logged out successfully' });
+  });
+
+  static logoutAll = asyncHandler(async (req, res) => {
+    await AuthService.logoutAll(req.user.userId);
+    res.status(200).json({ success: true, message: 'Logged out from all devices' });
+  });
+
+  static me = asyncHandler(async (req, res) => {
+    res.status(200).json({ success: true, data: { user: req.user } });
+  });
+
+}
+
+export default AuthController;
 ```
 
 ### Step 3.7 — `server/src/routes/auth.js`
 
 ```javascript
 import { Router } from 'express';
-import * as authController from '../controllers/authController.js';
+import AuthController from '../controllers/authController.js';
 import { authenticate } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 import { loginSchema, signupSchema, refreshSchema } from '../validators/authValidator.js';
 
 const router = Router();
-router.post('/login',   validate(loginSchema),   authController.login);
-router.post('/signup',  validate(signupSchema),  authController.signup);
-router.post('/refresh', validate(refreshSchema), authController.refresh);
-router.get('/me',       authenticate,            authController.me);
+router.post('/login',      validate(loginSchema),   AuthController.login);
+router.post('/signup',     validate(signupSchema),  AuthController.signup);
+router.post('/refresh',    validate(refreshSchema), AuthController.refresh);
+router.post('/logout',     validate(refreshSchema), AuthController.logout);
+router.post('/logout-all', authenticate,            AuthController.logoutAll);
+router.get('/me',          authenticate,            AuthController.me);
 export default router;
 ```
 
@@ -642,20 +687,30 @@ Function signatures (implement body for each):
 
 ### Step 4.3 — `server/src/controllers/memberController.js`
 
-Pattern for every handler:
+> **Pattern:** `class` + `static` arrow functions + `export default`. See CLAUDE.md.
+
 ```javascript
 import { asyncHandler } from '../utils/asyncHandler.js';
-import * as memberService from '../services/memberService.js';
+import MemberService from '../services/memberService.js';
 
-export const createMember = asyncHandler(async (req, res) => {
-  const data = await memberService.createMember({
-    tenantId: req.user.tenantId,
-    actorId:  req.user.userId,
-    ...req.body,
+class MemberController {
+
+  static createMember = asyncHandler(async (req, res) => {
+    const data = await MemberService.createMember({
+      tenantId: req.user.tenantId,
+      actorId:  req.user.userId,
+      ...req.body,
+    });
+    res.status(201).json({ success: true, data });
   });
-  res.status(201).json({ success: true, data });
-});
-// ... listMembers, getMember, updateMember
+
+  static listMembers  = asyncHandler(async (req, res) => { /* ... */ });
+  static getMember    = asyncHandler(async (req, res) => { /* ... */ });
+  static updateMember = asyncHandler(async (req, res) => { /* ... */ });
+
+}
+
+export default MemberController;
 ```
 
 ### Step 4.4 — `server/src/routes/members.js`
@@ -666,15 +721,15 @@ import { authenticate } from '../middleware/auth.js';
 import { requirePermission } from '../middleware/rbac.js';
 import { validate } from '../middleware/validate.js';
 import { createMemberSchema, updateMemberSchema } from '../validators/memberValidator.js';
-import * as ctrl from '../controllers/memberController.js';
+import MemberController from '../controllers/memberController.js';
 
 const router = Router();
 router.use(authenticate);
 
-router.get('/',    requirePermission('members', 'read'),  ctrl.listMembers);
-router.post('/',   validate(createMemberSchema), requirePermission('members', 'write'), ctrl.createMember);
-router.get('/:id', requirePermission('members', 'read'),  ctrl.getMember);
-router.put('/:id', validate(updateMemberSchema), requirePermission('members', 'write'), ctrl.updateMember);
+router.get('/',    requirePermission('members', 'read'),  MemberController.listMembers);
+router.post('/',   validate(createMemberSchema), requirePermission('members', 'write'), MemberController.createMember);
+router.get('/:id', requirePermission('members', 'read'),  MemberController.getMember);
+router.put('/:id', validate(updateMemberSchema), requirePermission('members', 'write'), MemberController.updateMember);
 
 export default router;
 ```
@@ -984,107 +1039,112 @@ import { earnPoints, redeemPoints } from './ledgerService.js';
 import { checkAndUpgradeTier } from './tierService.js';
 import { ApiError } from '../utils/ApiError.js';
 
-export async function createOrder({
-  tenantId, actorId, idempotencyKey,
-  memberId, billId, items, totalAmount,
-  storeId, walletUsed, pointsToRedeem, offerDiscount,
-}) {
-  // 1. Validate member
-  const member = await Member.findOne({ _id: memberId, tenantId });
-  if (!member) throw new ApiError(404, 'Member not found');
-  if (member.status !== 'active') throw new ApiError(400, 'Member is not active');
+class OrderService {
 
-  const session = await mongoose.startSession();
-  let result;
-  try {
-    await session.withTransaction(async () => {
-      // 2. Redeem first (if requested)
-      let pointsBurned = 0;
-      if (walletUsed && pointsToRedeem > 0) {
-        ({ pointsBurned } = await redeemPoints(
-          { tenantId, memberId, pointsToRedeem, orderId: null }, session
-        ));
-      }
+  static createOrder = async ({
+    tenantId, actorId, idempotencyKey,
+    memberId, billId, items, totalAmount,
+    storeId, walletUsed, pointsToRedeem, offerDiscount,
+  }) => {
+    const member = await Member.findOne({ _id: memberId, tenantId });
+    if (!member) throw new ApiError(404, 'Member not found');
+    if (member.status !== 'active') throw new ApiError(400, 'Member is not active');
 
-      // 3. Create order
-      const [order] = await Order.create([{
-        tenantId, memberId, billId, items, totalAmount,
-        storeId, actorId, offerDiscount,
-        pointsBurned, status: 'completed',
-      }], { session });
+    const session = await mongoose.startSession();
+    let result;
+    try {
+      await session.withTransaction(async () => {
+        let pointsBurned = 0;
+        if (walletUsed && pointsToRedeem > 0) {
+          ({ pointsBurned } = await redeemPoints(
+            { tenantId, memberId, pointsToRedeem, orderId: null }, session
+          ));
+        }
 
-      // 4. Earn points
-      const { pointsEarned } = await earnPoints(
-        { tenantId, memberId, orderId: order._id, totalAmount, actorId },
-        session
-      );
+        const [order] = await Order.create([{
+          tenantId, memberId, billId, items, totalAmount,
+          storeId, actorId, offerDiscount,
+          pointsBurned, status: 'completed',
+        }], { session });
 
-      // 5. Update order with earned points
-      await Order.updateOne({ _id: order._id }, { pointsEarned }, { session });
+        const { pointsEarned } = await earnPoints(
+          { tenantId, memberId, orderId: order._id, totalAmount, actorId },
+          session
+        );
 
-      // 6. Check tier upgrade (recursive, inside same txn)
-      await checkAndUpgradeTier({ tenantId, memberId, totalAmount }, session);
+        await Order.updateOne({ _id: order._id }, { pointsEarned }, { session });
 
-      // 7. Save idempotency record
-      const response = {
-        success: true,
-        data: { orderId: order._id, billId, pointsEarned, pointsBurned, totalAmount },
-      };
-      await IdempotencyKey.create([{
-        tenantId, key: idempotencyKey,
-        statusCode: 201, response,
-      }], { session });
+        await checkAndUpgradeTier({ tenantId, memberId, totalAmount }, session);
 
-      // 8. Audit
-      await AuditLog.create([{
-        tenantId, actorId, action: 'ORDER_CREATED',
-        entity: 'Order', entityId: order._id,
-        after: { pointsEarned, pointsBurned, totalAmount },
-      }], { session });
+        const response = {
+          success: true,
+          data: { orderId: order._id, billId, pointsEarned, pointsBurned, totalAmount },
+        };
+        await IdempotencyKey.create([{
+          tenantId, key: idempotencyKey,
+          statusCode: 201, response,
+        }], { session });
 
-      result = response;
-    });
-  } finally {
-    await session.endSession();
-  }
-  return result;
+        await AuditLog.create([{
+          tenantId, actorId, action: 'ORDER_CREATED',
+          entity: 'Order', entityId: order._id,
+          after: { pointsEarned, pointsBurned, totalAmount },
+        }], { session });
+
+        result = response;
+      });
+    } finally {
+      await session.endSession();
+    }
+    return result;
+  };
+
 }
+
+export default OrderService;
 ```
 
 ### Step 6.5 — `server/src/controllers/orderController.js`
 
-Thin handler:
+> **Pattern:** `class` + `static` arrow functions + `export default`. See CLAUDE.md.
+
 ```javascript
 import { asyncHandler } from '../utils/asyncHandler.js';
-import * as orderService from '../services/orderService.js';
+import OrderService from '../services/orderService.js';
 import Order from '../models/Order.js';
 import { ApiError } from '../utils/ApiError.js';
 
-export const createOrder = asyncHandler(async (req, res) => {
-  const result = await orderService.createOrder({
-    tenantId:       req.user.tenantId,
-    actorId:        req.user.userId,
-    idempotencyKey: req.idempotencyKey,
-    ...req.body,
+class OrderController {
+
+  static createOrder = asyncHandler(async (req, res) => {
+    const result = await OrderService.createOrder({
+      tenantId:       req.user.tenantId,
+      actorId:        req.user.userId,
+      idempotencyKey: req.idempotencyKey,
+      ...req.body,
+    });
+    res.status(201).json(result);
   });
-  res.status(201).json(result);
-});
 
-export const listOrders = asyncHandler(async (req, res) => {
-  const { cursor, limit = 20, memberId } = req.query;
-  const query = { tenantId: req.user.tenantId };
-  if (memberId) query.memberId = memberId;
-  if (cursor) query._id = { $lt: cursor };
-  const orders = await Order.find(query).sort({ _id: -1 }).limit(Number(limit) + 1);
-  const nextCursor = orders.length > limit ? orders.pop()._id : null;
-  res.json({ success: true, data: { orders, nextCursor } });
-});
+  static listOrders = asyncHandler(async (req, res) => {
+    const { cursor, limit = 20, memberId } = req.query;
+    const query = { tenantId: req.user.tenantId };
+    if (memberId) query.memberId = memberId;
+    if (cursor) query._id = { $lt: cursor };
+    const orders = await Order.find(query).sort({ _id: -1 }).limit(Number(limit) + 1);
+    const nextCursor = orders.length > limit ? orders.pop()._id : null;
+    res.json({ success: true, data: { orders, nextCursor } });
+  });
 
-export const getOrder = asyncHandler(async (req, res) => {
-  const order = await Order.findOne({ _id: req.params.id, tenantId: req.user.tenantId });
-  if (!order) throw new ApiError(404, 'Order not found');
-  res.json({ success: true, data: { order } });
-});
+  static getOrder = asyncHandler(async (req, res) => {
+    const order = await Order.findOne({ _id: req.params.id, tenantId: req.user.tenantId });
+    if (!order) throw new ApiError(404, 'Order not found');
+    res.json({ success: true, data: { order } });
+  });
+
+}
+
+export default OrderController;
 ```
 
 ### Step 6.6 — `server/src/routes/orders.js`
@@ -1096,7 +1156,7 @@ import { requirePermission } from '../middleware/rbac.js';
 import { validate } from '../middleware/validate.js';
 import { idempotency } from '../middleware/idempotency.js';
 import { createOrderSchema } from '../validators/orderValidator.js';
-import * as ctrl from '../controllers/orderController.js';
+import OrderController from '../controllers/orderController.js';
 
 const router = Router();
 router.use(authenticate);
@@ -1105,10 +1165,10 @@ router.post('/',
   validate(createOrderSchema),
   requirePermission('transactions', 'write'),
   idempotency,
-  ctrl.createOrder
+  OrderController.createOrder
 );
-router.get('/',    requirePermission('transactions', 'read'), ctrl.listOrders);
-router.get('/:id', requirePermission('transactions', 'read'), ctrl.getOrder);
+router.get('/',    requirePermission('transactions', 'read'), OrderController.listOrders);
+router.get('/:id', requirePermission('transactions', 'read'), OrderController.getOrder);
 
 export default router;
 ```
@@ -1445,14 +1505,14 @@ startJobs();
 import { Router } from 'express';
 import { authenticate } from '../middleware/auth.js';
 import { requireRole } from '../middleware/rbac.js';
-import * as platformController from '../controllers/platformController.js';
+import PlatformController from '../controllers/platformController.js';
 
 const router = Router();
 router.use(authenticate, requireRole('PLATFORM_ADMIN'));
 
-router.get('/tenants',            platformController.listTenants);
-router.get('/tenants/:id',        platformController.getTenant);
-router.patch('/tenants/:id/status', platformController.updateTenantStatus);
+router.get('/tenants',              PlatformController.listTenants);
+router.get('/tenants/:id',          PlatformController.getTenant);
+router.patch('/tenants/:id/status', PlatformController.updateTenantStatus);
 
 export default router;
 ```
@@ -1583,6 +1643,7 @@ Build in this exact order (each page calls the API + shows data before moving on
 | 9 | Cron jobs registered (visible in startup log) |
 | 10 | Platform admin can list and suspend tenants |
 | 11 | Full frontend working end-to-end |
+| 12 | _(future)_ Razorpay payment gateway — plan selection → checkout → webhook activation |
 
 ---
 

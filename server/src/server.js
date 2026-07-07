@@ -2,9 +2,11 @@ import 'dotenv/config';
 import { connectDB } from './config/db.js';
 import { env } from './config/env.js';
 import app from './app.js';
+import { startJobs } from './jobs/scheduler.js';
 
 async function start() {
   await connectDB();
+  startJobs();
   const server = app.listen(env.PORT, () => {
     console.log(`Server running on port ${env.PORT} [${env.NODE_ENV}]`);
   });

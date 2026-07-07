@@ -36,6 +36,8 @@ class AuthService {
     const valid = await user.verifyPassword(password);
     if (!valid) throw new ApiError(401, 'Invalid credentials');
 
+    if (user.status !== 'active') throw new ApiError(403, 'Account is deactivated');
+
     const tokens = await issueTokens(user);
     return { user, ...tokens };
   };
@@ -58,11 +60,12 @@ class AuthService {
           { session }
         );
 
-        const [user] = await User.create(
-          [{ tenantId: tenant._id, name: ownerName, email: email.toLowerCase(), role: USER_ROLES.MERCHANT_OWNER }],
-          { session }
-        );
-
+        const user = new User({
+          tenantId: tenant._id,
+          name: ownerName,
+          email: email.toLowerCase(),
+          role: USER_ROLES.MERCHANT_OWNER,
+        });
         await user.setPassword(password);
         await user.save({ session });
 

@@ -5,9 +5,9 @@ import { connectDB } from '../src/config/db.js';
 import User from '../src/models/User.js';
 import { USER_ROLES } from '../src/config/constants.js';
 
-const ADMIN_EMAIL    = 'info@monilcorpus.com';
+const ADMIN_EMAIL    = 'vaibhav@gmail.com';
 const ADMIN_NAME     = 'Vaibhav Pandey';
-const ADMIN_PASSWORD = 'ChangeThisPassword123!';
+const ADMIN_PASSWORD = 'Vaibhav@123';
 
 async function seed() {
   await connectDB();

@@ -30,12 +30,26 @@ const userSchema = new mongoose.Schema(
       enum: Object.values(USER_ROLES),
       default: USER_ROLES.MERCHANT_OWNER,
     },
+    roleId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Role',
+      default: null, // set only for MERCHANT_MANAGER / MERCHANT_STAFF
+    },
+    status: {
+      type: String,
+      enum: ['active', 'inactive'],
+      default: 'active',
+    },
+    empId: {
+      type: String, // auto-generated for staff ("EMP-XXXXXXXX"), null otherwise
+    },
   },
   { timestamps: true }
 );
 
 // same email can exist across tenants, but not within one tenant
 userSchema.index({ tenantId: 1, email: 1 }, { unique: true });
+userSchema.index({ tenantId: 1, role: 1 });
 
 userSchema.methods.setPassword = async function (plaintext) {
   this.passwordHash = await bcrypt.hash(plaintext, BCRYPT_ROUNDS);

@@ -5,6 +5,24 @@ import {
   PageHeader, Button, Table, Badge, statusTone, Spinner, ErrorNote, Modal, EmptyState, num, fmtDate,
 } from '../components/ui.jsx';
 
+function InfoRow({ label, children }) {
+  return (
+    <div className="flex items-center justify-between gap-4 py-1.5 text-sm">
+      <span className="shrink-0 text-gray-500">{label}</span>
+      <span className="text-right font-medium text-gray-800">{children}</span>
+    </div>
+  );
+}
+
+function MiniStat({ label, value }) {
+  return (
+    <div className="rounded-lg bg-gray-50 p-3 text-center">
+      <div className="text-[11px] uppercase tracking-wide text-gray-400">{label}</div>
+      <div className="mt-0.5 text-xl font-semibold text-gray-900">{value}</div>
+    </div>
+  );
+}
+
 function TenantDetail({ tenant, onClose }) {
   const queryClient = useQueryClient();
   const [error, setError] = useState('');
@@ -25,34 +43,84 @@ function TenantDetail({ tenant, onClose }) {
     onError: (err) => setError(apiMessage(err)),
   });
 
+  const t = detail.data?.tenant ?? tenant;
+  const owner = detail.data?.owner;
+  const staff = detail.data?.staff ?? [];
   const s = detail.data?.stats;
-  const status = detail.data?.tenant?.status ?? tenant.status;
+  const status = t.status;
 
   return (
     <div className="space-y-4">
       {detail.isPending ? (
-        <Spinner label="Loading stats…" />
+        <Spinner label="Loading tenant…" />
       ) : (
-        <div className="grid grid-cols-3 gap-3 text-center">
-          <div className="rounded-lg bg-gray-50 p-4">
-            <div className="text-xs uppercase tracking-wide text-gray-400">Members</div>
-            <div className="mt-1 text-2xl font-semibold text-gray-900">{num(s?.memberCount)}</div>
+        <>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="rounded-lg border border-gray-200 p-4">
+              <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-400">Business</h4>
+              <InfoRow label="Name">{t.businessName}</InfoRow>
+              <InfoRow label="Slug">{t.slug}</InfoRow>
+              <InfoRow label="Plan"><Badge tone="navy">{t.plan}</Badge></InfoRow>
+              <InfoRow label="Billing email">{t.billingEmail || '—'}</InfoRow>
+              <InfoRow label="Joined">{fmtDate(t.createdAt)}</InfoRow>
+              <InfoRow label="Status"><Badge tone={statusTone(status)}>{status}</Badge></InfoRow>
+            </div>
+            <div className="rounded-lg border border-gray-200 p-4">
+              <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-400">Owner account</h4>
+              {owner ? (
+                <>
+                  <InfoRow label="Name">{owner.name}</InfoRow>
+                  <InfoRow label="Email">{owner.email}</InfoRow>
+                  <InfoRow label="Account status"><Badge tone={statusTone(owner.status)}>{owner.status}</Badge></InfoRow>
+                  <InfoRow label="Created">{fmtDate(owner.createdAt)}</InfoRow>
+                </>
+              ) : (
+                <p className="py-4 text-sm text-gray-400">No owner account found.</p>
+              )}
+            </div>
           </div>
-          <div className="rounded-lg bg-gray-50 p-4">
-            <div className="text-xs uppercase tracking-wide text-gray-400">Orders</div>
-            <div className="mt-1 text-2xl font-semibold text-gray-900">{num(s?.orderCount)}</div>
-          </div>
-          <div className="rounded-lg bg-gray-50 p-4">
-            <div className="text-xs uppercase tracking-wide text-gray-400">Pts liability</div>
-            <div className="mt-1 text-2xl font-semibold text-gray-900">{num(s?.pointsLiability)}</div>
-          </div>
-        </div>
-      )}
 
-      <div className="flex items-center justify-between rounded-lg border border-gray-200 px-4 py-3 text-sm">
-        <span className="text-gray-600">Current status</span>
-        <Badge tone={statusTone(status)}>{status}</Badge>
-      </div>
+          <div className="grid grid-cols-3 gap-3 sm:grid-cols-6">
+            <MiniStat label="Members" value={num(s?.memberCount)} />
+            <MiniStat label="Orders" value={num(s?.orderCount)} />
+            <MiniStat label="Pts owed" value={num(s?.pointsLiability)} />
+            <MiniStat label="Staff" value={num(s?.staffCount)} />
+            <MiniStat label="Stores" value={num(s?.storeCount)} />
+            <MiniStat label="Rules" value={num(s?.earnRuleCount)} />
+          </div>
+
+          <div className="flex items-center justify-between rounded-lg border border-gray-200 px-4 py-2.5 text-sm">
+            <span className="text-gray-500">Last order</span>
+            <span className="font-medium text-gray-800">
+              {s?.lastOrderAt ? `${fmtDate(s.lastOrderAt)} · ₹${num(s.lastOrderAmount)}` : 'No orders yet'}
+            </span>
+          </div>
+
+          {staff.length > 0 && (
+            <div className="rounded-lg border border-gray-200 p-4">
+              <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-400">
+                Team ({staff.length})
+              </h4>
+              <ul className="divide-y divide-gray-100">
+                {staff.map((u) => (
+                  <li key={u.id} className="flex items-center justify-between py-2 text-sm">
+                    <span>
+                      <span className="font-medium text-gray-800">{u.name}</span>
+                      <span className="ml-2 text-gray-400">{u.email}</span>
+                    </span>
+                    <span className="flex items-center gap-2">
+                      <Badge tone={u.role === 'MERCHANT_MANAGER' ? 'blue' : 'gray'}>
+                        {u.role === 'MERCHANT_MANAGER' ? 'Manager' : 'Staff'}
+                      </Badge>
+                      <Badge tone={statusTone(u.status)}>{u.status}</Badge>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </>
+      )}
 
       <ErrorNote>{error}</ErrorNote>
 
@@ -126,7 +194,7 @@ export default function Platform() {
         ))}
       </Table>
 
-      <Modal open={!!selected} onClose={() => setSelected(null)} title={selected?.businessName || ''}>
+      <Modal open={!!selected} onClose={() => setSelected(null)} title={selected?.businessName || ''} wide>
         {selected && <TenantDetail tenant={selected} onClose={() => setSelected(null)} />}
       </Modal>
     </div>

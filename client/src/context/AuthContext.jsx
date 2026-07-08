@@ -55,6 +55,16 @@ export function AuthProvider({ children }) {
     setUser(null);
   };
 
+  const updateUser = (u) => {
+    const merged = { ...readUser(), ...u };
+    localStorage.setItem('user', JSON.stringify(merged));
+    setUser(merged);
+  };
+
+  const updateTenant = (t) => {
+    localStorage.setItem('tenant', JSON.stringify(t));
+  };
+
   const tenant = (() => {
     try {
       return JSON.parse(localStorage.getItem('tenant'));
@@ -64,7 +74,7 @@ export function AuthProvider({ children }) {
   })();
 
   return (
-    <AuthContext.Provider value={{ user, tenant, login, register, logout }}>
+    <AuthContext.Provider value={{ user, tenant, login, register, logout, updateUser, updateTenant }}>
       {children}
     </AuthContext.Provider>
   );

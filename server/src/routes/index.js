@@ -9,6 +9,7 @@ import staffRouter from './staff.js';
 import rolesRouter from './roles.js';
 import analyticsRouter from './analytics.js';
 import platformRouter from './platform.js';
+import profileRouter from './profile.js';
 
 const router = Router();
 
@@ -22,5 +23,6 @@ router.use('/staff', staffRouter);
 router.use('/roles', rolesRouter);
 router.use('/analytics', analyticsRouter);
 router.use('/platform', platformRouter);
+router.use('/profile', profileRouter);
 
 export default router;

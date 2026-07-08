@@ -38,15 +38,19 @@ export default function Topbar() {
 
       <div className="flex items-center gap-4">
         <Badge tone="brand">{roleLabel[user?.role] || user?.role}</Badge>
-        <div className="flex items-center gap-2.5">
+        <button
+          onClick={() => navigate('/app/profile')}
+          title="My profile"
+          className="flex items-center gap-2.5 rounded-lg px-2 py-1 transition-colors hover:bg-gray-100"
+        >
           <span className="flex h-9 w-9 items-center justify-center rounded-full bg-navy-900 text-xs font-semibold text-white">
             {initials}
           </span>
-          <div className="hidden sm:block">
+          <div className="hidden text-left sm:block">
             <div className="text-sm font-medium leading-tight text-gray-800">{user?.name}</div>
             <div className="text-xs text-gray-400">{user?.email}</div>
           </div>
-        </div>
+        </button>
         <button
           onClick={onLogout}
           title="Logout"

@@ -16,6 +16,7 @@ import Stores from './pages/Stores.jsx';
 import Team from './pages/Team.jsx';
 import Roles from './pages/Roles.jsx';
 import Platform from './pages/Platform.jsx';
+import Profile from './pages/Profile.jsx';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -60,6 +61,7 @@ export default function App() {
               <Route path="team" element={<RoleRoute roles={[MERCHANT_OWNER]}><Team /></RoleRoute>} />
               <Route path="roles" element={<RoleRoute roles={[MERCHANT_OWNER]}><Roles /></RoleRoute>} />
               <Route path="platform" element={<RoleRoute roles={[PLATFORM_ADMIN]}><Platform /></RoleRoute>} />
+              <Route path="profile" element={<Profile />} />
             </Route>
 
             <Route path="*" element={<Home />} />

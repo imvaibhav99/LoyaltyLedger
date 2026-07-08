@@ -1,16 +1,66 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import api, { apiMessage } from '../api/axios.js';
 import {
-  PageHeader, Button, Card, Badge, ErrorNote, Field, Input, num, inr,
+  PageHeader, Button, Card, Badge, ErrorNote, Field, Input, Modal, num, inr,
 } from '../components/ui.jsx';
-import { IconSearch, IconCheck, IconWallet } from '../components/icons.jsx';
+import { IconSearch, IconCheck, IconWallet, IconPlus } from '../components/icons.jsx';
+
+function QuickAddMember({ open, onClose, prefillPhone, onCreated }) {
+  const queryClient = useQueryClient();
+  const [name, setName] = useState('');
+  const [phone, setPhone] = useState('');
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    if (open) {
+      setName('');
+      setPhone(/^\d+$/.test(prefillPhone) ? prefillPhone : '');
+      setError('');
+    }
+  }, [open, prefillPhone]);
+
+  const create = useMutation({
+    mutationFn: (payload) => api.post('/members', payload).then((r) => r.data.data),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['members'] });
+      queryClient.invalidateQueries({ queryKey: ['pos-search'] });
+      onCreated(data.member);
+      onClose();
+    },
+    onError: (err) => setError(apiMessage(err)),
+  });
+
+  return (
+    <Modal open={open} onClose={onClose} title="Enroll new member">
+      <form
+        onSubmit={(e) => { e.preventDefault(); create.mutate({ name, phone }); }}
+        className="space-y-4"
+      >
+        <Field label="Full name">
+          <Input required minLength={2} autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Priya Sharma" />
+        </Field>
+        <Field label="Phone">
+          <Input required minLength={10} maxLength={15} value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="9876543210" />
+        </Field>
+        <ErrorNote>{error}</ErrorNote>
+        <Button type="submit" disabled={create.isPending} className="w-full justify-center">
+          {create.isPending ? 'Enrolling…' : 'Enroll & select'}
+        </Button>
+        <p className="text-center text-xs text-gray-400">
+          Full profile (email, city, birthday) can be added later from the Members page.
+        </p>
+      </form>
+    </Modal>
+  );
+}
 
 export default function POS() {
   const queryClient = useQueryClient();
   const [phone, setPhone] = useState('');
   const [searched, setSearched] = useState('');
   const [selected, setSelected] = useState(null);
+  const [addOpen, setAddOpen] = useState(false);
   const [billId, setBillId] = useState('');
   const [amount, setAmount] = useState('');
   const [redeem, setRedeem] = useState(false);
@@ -18,10 +68,21 @@ export default function POS() {
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
 
+  // live search: fires after 3+ characters, debounced 300ms
+  useEffect(() => {
+    const q = phone.trim();
+    if (q.length < 3) {
+      setSearched('');
+      return;
+    }
+    const t = setTimeout(() => setSearched(q), 300);
+    return () => clearTimeout(t);
+  }, [phone]);
+
   const search = useQuery({
     queryKey: ['pos-search', searched],
-    queryFn: () => api.get('/members', { params: { search: searched, limit: 5 } }).then((r) => r.data.data),
-    enabled: !!searched,
+    queryFn: () => api.get('/members', { params: { search: searched, limit: 6 } }).then((r) => r.data.data),
+    enabled: searched.length >= 3,
   });
 
   const detail = useQuery({
@@ -74,6 +135,9 @@ export default function POS() {
     setError('');
   };
 
+  const results = search.data?.data ?? [];
+  const showResults = searched.length >= 3;
+
   return (
     <div>
       <PageHeader title="POS Counter" subtitle="Look up the customer, ring the bill, award or redeem points." />
@@ -82,46 +146,58 @@ export default function POS() {
         {/* ── Left: member lookup ─────────────────────────── */}
         <div className="lg:col-span-2">
           <Card className="p-5">
-            <h3 className="mb-3 text-sm font-semibold text-gray-800">1 · Find member</h3>
-            <form
-              onSubmit={(e) => { e.preventDefault(); setSearched(phone.trim()); setSelected(null); setResult(null); }}
-              className="flex gap-2"
-            >
-              <div className="relative flex-1">
-                <IconSearch size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
-                <input
-                  value={phone}
-                  onChange={(e) => setPhone(e.target.value)}
-                  placeholder="Phone or name…"
-                  className="w-full rounded-lg border border-gray-300 py-2 pl-9 pr-3 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
-                />
-              </div>
-              <Button type="submit" variant="ghost">Find</Button>
-            </form>
-
-            {search.isFetching && <p className="mt-3 text-sm text-gray-400">Searching…</p>}
-            {search.data && !search.data.data.length && (
-              <p className="mt-3 text-sm text-gray-400">No member found. Enroll them from the Members page first.</p>
-            )}
-            <div className="mt-3 space-y-2">
-              {search.data?.data.map((m) => (
-                <button
-                  key={m.id}
-                  onClick={() => pickMember(m)}
-                  className={`flex w-full items-center justify-between rounded-lg border px-3 py-2.5 text-left text-sm transition-colors ${
-                    selected?.id === m.id
-                      ? 'border-brand-500 bg-brand-50'
-                      : 'border-gray-200 bg-white hover:border-gray-300 hover:bg-gray-50'
-                  }`}
-                >
-                  <span>
-                    <span className="block font-medium text-gray-800">{m.name}</span>
-                    <span className="text-xs text-gray-500">{m.phone} · {m.memberId}</span>
-                  </span>
-                  {selected?.id === m.id && <IconCheck size={16} className="text-brand-600" />}
-                </button>
-              ))}
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-gray-800">1 · Find member</h3>
+              <Button variant="ghost" className="px-3 py-1.5 text-xs" onClick={() => setAddOpen(true)}>
+                <IconPlus size={14} /> New member
+              </Button>
             </div>
+
+            <div className="relative">
+              <IconSearch size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+              <input
+                value={phone}
+                onChange={(e) => setPhone(e.target.value)}
+                placeholder="Type 3+ digits of phone or name…"
+                className="w-full rounded-lg border border-gray-300 py-2 pl-9 pr-3 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100"
+              />
+            </div>
+            {!showResults && phone.trim().length > 0 && phone.trim().length < 3 && (
+              <p className="mt-2 text-xs text-gray-400">Keep typing — search starts at 3 characters.</p>
+            )}
+
+            {showResults && (
+              <div className="mt-3 space-y-2">
+                {search.isFetching && !results.length && (
+                  <p className="text-sm text-gray-400">Searching…</p>
+                )}
+                {!search.isFetching && !results.length && (
+                  <div className="rounded-lg border border-dashed border-gray-300 p-4 text-center">
+                    <p className="text-sm text-gray-500">No member matches “{searched}”.</p>
+                    <Button className="mt-3" onClick={() => setAddOpen(true)}>
+                      <IconPlus size={15} /> Enroll “{searched}” as new member
+                    </Button>
+                  </div>
+                )}
+                {results.map((m) => (
+                  <button
+                    key={m.id}
+                    onClick={() => pickMember(m)}
+                    className={`flex w-full items-center justify-between rounded-lg border px-3 py-2.5 text-left text-sm transition-colors ${
+                      selected?.id === m.id
+                        ? 'border-brand-500 bg-brand-50'
+                        : 'border-gray-200 bg-white hover:border-gray-300 hover:bg-gray-50'
+                    }`}
+                  >
+                    <span>
+                      <span className="block font-medium text-gray-800">{m.name}</span>
+                      <span className="text-xs text-gray-500">{m.phone} · {m.memberId}</span>
+                    </span>
+                    {selected?.id === m.id && <IconCheck size={16} className="text-brand-600" />}
+                  </button>
+                ))}
+              </div>
+            )}
           </Card>
 
           {selected && (
@@ -225,6 +301,16 @@ export default function POS() {
           )}
         </div>
       </div>
+
+      <QuickAddMember
+        open={addOpen}
+        onClose={() => setAddOpen(false)}
+        prefillPhone={phone.trim()}
+        onCreated={(member) => {
+          pickMember(member);
+          setPhone(member.phone);
+        }}
+      />
     </div>
   );
 }

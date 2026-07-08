@@ -1,13 +1,16 @@
-
-
 .DS_Store
+node_modules/
+.env
+dist/
 
 # Documentation (private — not for public repo)
-# PRD.md
-# TRD.md
-# saasFlow.md
-# schema.md
-# implementation.md
-# AUTH_GUIDE.md
-# B2C_ANALYSIS.md
-# saasFlow.md.bak
+PRD.md
+TRD.md
+saasFlow.md
+saasFlow.md.bak
+schema.md
+implementation.md
+AUTH_GUIDE.md
+B2C_ANALYSIS.md
+Understanding.md
+CLAUDE.md

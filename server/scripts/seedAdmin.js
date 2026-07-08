@@ -5,9 +5,14 @@ import { connectDB } from '../src/config/db.js';
 import User from '../src/models/User.js';
 import { USER_ROLES } from '../src/config/constants.js';
 
-const ADMIN_EMAIL    = 'vaibhav@gmail.com';
-const ADMIN_NAME     = 'Vaibhav Pandey';
-const ADMIN_PASSWORD = 'Vaibhav@123';
+const ADMIN_EMAIL    = process.env.PLATFORM_ADMIN_EMAIL;
+const ADMIN_NAME     = process.env.PLATFORM_ADMIN_NAME || 'Platform Admin';
+const ADMIN_PASSWORD = process.env.PLATFORM_ADMIN_PASSWORD;
+
+if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
+  console.error('Missing PLATFORM_ADMIN_EMAIL or PLATFORM_ADMIN_PASSWORD in .env');
+  process.exit(1);
+}
 
 async function seed() {
   await connectDB();

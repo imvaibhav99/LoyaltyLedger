@@ -5,6 +5,7 @@ import RefreshToken from '../models/RefreshToken.js';
 import { signAccessToken, signRefreshToken, verifyRefreshToken, hashToken } from '../utils/token.js';
 import { ApiError } from '../utils/ApiError.js';
 import { USER_ROLES } from '../config/constants.js';
+import EmailService from './emailService.js';
 
 const refreshExpiresAt = () => new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
@@ -72,6 +73,14 @@ class AuthService {
         const tokens = await issueTokens(user, session);
         result = { user, tenant, ...tokens };
       });
+
+      // fire-and-forget after commit — mail failure must never fail a signup
+      EmailService.sendWelcome({
+        email: result.user.email,
+        name: result.user.name,
+        businessName: result.tenant.businessName,
+      }).catch(() => {});
+
       return result;
     } finally {
       await session.endSession();

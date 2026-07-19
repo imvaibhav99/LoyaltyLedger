@@ -2,15 +2,21 @@ import { Router } from 'express';
 import AuthController from '../controllers/authController.js';
 import { authenticate } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
-import { loginSchema, signupSchema, refreshSchema } from '../validators/authValidator.js';
+import {
+  loginSchema, signupSchema, refreshSchema,
+  forgotPasswordSchema, verifyResetCodeSchema, resetPasswordSchema,
+} from '../validators/authValidator.js';
 
 const router = Router();
 
-router.post('/login',       validate(loginSchema),   AuthController.login);
-router.post('/signup',      validate(signupSchema),  AuthController.signup);
-router.post('/refresh',     validate(refreshSchema), AuthController.refresh);
-router.post('/logout',      validate(refreshSchema), AuthController.logout);
-router.post('/logout-all',  authenticate,            AuthController.logoutAll);
-router.get('/me',           authenticate,            AuthController.me);
+router.post('/login',             validate(loginSchema),           AuthController.login);
+router.post('/signup',            validate(signupSchema),          AuthController.signup);
+router.post('/refresh',           validate(refreshSchema),         AuthController.refresh);
+router.post('/logout',            validate(refreshSchema),         AuthController.logout);
+router.post('/logout-all',        authenticate,                    AuthController.logoutAll);
+router.get('/me',                 authenticate,                    AuthController.me);
+router.post('/forgot-password',   validate(forgotPasswordSchema),  AuthController.forgotPassword);
+router.post('/verify-reset-code', validate(verifyResetCodeSchema), AuthController.verifyResetCode);
+router.post('/reset-password',    validate(resetPasswordSchema),   AuthController.resetPassword);
 
 export default router;

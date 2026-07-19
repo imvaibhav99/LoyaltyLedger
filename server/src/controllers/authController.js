@@ -31,6 +31,21 @@ class AuthController {
   res.status(200).json({ success: true, data: { user: req.user } });
 });
 
+ static forgotPassword = asyncHandler(async (req, res) => {
+  await AuthService.forgotPassword(req.body);
+  res.status(200).json({ success: true, message: 'If that account exists, a reset code has been sent' });
+});
+
+ static verifyResetCode = asyncHandler(async (req, res) => {
+  await AuthService.verifyResetCode(req.body);
+  res.status(200).json({ success: true, message: 'Code verified' });
+});
+
+ static resetPassword = asyncHandler(async (req, res) => {
+  await AuthService.resetPassword(req.body);
+  res.status(200).json({ success: true, message: 'Password reset successfully — please log in' });
+});
+
 }
 
 export default AuthController;

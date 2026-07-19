@@ -6,6 +6,7 @@ import RoleRoute from './components/RoleRoute.jsx';
 import AppLayout from './components/AppLayout.jsx';
 import Login from './pages/Login.jsx';
 import Register from './pages/Register.jsx';
+import ForgotPassword from './pages/ForgotPassword.jsx';
 import Dashboard from './pages/Dashboard.jsx';
 import Members from './pages/Members.jsx';
 import MemberDetail from './pages/MemberDetail.jsx';
@@ -41,6 +42,7 @@ export default function App() {
             <Route path="/" element={<Home />} />
             <Route path="/login" element={<Login />} />
             <Route path="/register" element={<Register />} />
+            <Route path="/forgot-password" element={<ForgotPassword />} />
 
             <Route
               path="/app"

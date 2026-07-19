@@ -68,6 +68,12 @@ export const IconCoin = (p) => (
 export const IconCheck = (p) => (
   <I {...p}><path d="m5 13 4 4L19 7" /></I>
 );
+export const IconEye = (p) => (
+  <I {...p}><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z" /><circle cx="12" cy="12" r="3" /></I>
+);
+export const IconEyeOff = (p) => (
+  <I {...p}><path d="M2.5 12S6 5.5 12 5.5c1.8 0 3.4.6 4.7 1.4M21.5 12S18 18.5 12 18.5c-1.8 0-3.4-.6-4.7-1.4" /><path d="M4 20 20 4" /></I>
+);
 export const IconAlert = (p) => (
   <I {...p}><path d="M12 4 2.5 20h19L12 4Z" /><path d="M12 10v4M12 17h.01" /></I>
 );

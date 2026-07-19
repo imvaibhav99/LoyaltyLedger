@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext.jsx';
 import { apiMessage } from '../api/axios.js';
-import { Button, Field, Input, Select, ErrorNote } from '../components/ui.jsx';
+import { Button, Field, Input, PasswordInput, Select, ErrorNote } from '../components/ui.jsx';
 import { AuthShell } from './Login.jsx';
 
 export default function Register() {
@@ -51,7 +51,7 @@ export default function Register() {
             <Input type="email" required value={form.email} onChange={set('email')} placeholder="you@business.com" />
           </Field>
           <Field label="Password" hint="Minimum 8 characters">
-            <Input type="password" required minLength={8} value={form.password} onChange={set('password')} placeholder="••••••••" />
+            <PasswordInput required minLength={8} value={form.password} onChange={set('password')} placeholder="••••••••" />
           </Field>
           <Field label="Plan">
             <Select value={form.plan} onChange={set('plan')}>

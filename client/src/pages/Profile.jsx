@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import api, { apiMessage } from '../api/axios.js';
 import { useAuth, ROLES } from '../context/AuthContext.jsx';
 import {
-  PageHeader, Button, Card, Badge, Spinner, ErrorNote, Field, Input, fmtDate,
+  PageHeader, Button, Card, Badge, Spinner, ErrorNote, Field, Input, PasswordInput, fmtDate,
 } from '../components/ui.jsx';
 import { IconCheck } from '../components/icons.jsx';
 
@@ -135,13 +135,13 @@ export default function Profile() {
           >
             <div className="grid gap-4 sm:grid-cols-3">
               <Field label="Current password">
-                <Input type="password" required value={pw.currentPassword} onChange={(e) => setPw({ ...pw, currentPassword: e.target.value })} />
+                <PasswordInput required value={pw.currentPassword} onChange={(e) => setPw({ ...pw, currentPassword: e.target.value })} />
               </Field>
               <Field label="New password">
-                <Input type="password" required minLength={8} value={pw.newPassword} onChange={(e) => setPw({ ...pw, newPassword: e.target.value })} />
+                <PasswordInput required minLength={8} value={pw.newPassword} onChange={(e) => setPw({ ...pw, newPassword: e.target.value })} />
               </Field>
               <Field label="Confirm new password">
-                <Input type="password" required minLength={8} value={pw.confirm} onChange={(e) => setPw({ ...pw, confirm: e.target.value })} />
+                <PasswordInput required minLength={8} value={pw.confirm} onChange={(e) => setPw({ ...pw, confirm: e.target.value })} />
               </Field>
             </div>
             <ErrorNote>{pwError}</ErrorNote>

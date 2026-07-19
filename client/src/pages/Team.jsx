@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import api, { apiMessage } from '../api/axios.js';
 import {
-  PageHeader, Button, Table, Badge, statusTone, Spinner, ErrorNote, Modal, Field, Input, Select, EmptyState, fmtDate,
+  PageHeader, Button, Table, Badge, statusTone, Spinner, ErrorNote, Modal, Field, Input, PasswordInput, Select, EmptyState, fmtDate,
 } from '../components/ui.jsx';
 import { IconPlus } from '../components/icons.jsx';
 
@@ -27,7 +27,7 @@ function StaffForm({ roles, onSubmit, busy, error }) {
           <Input type="email" required value={form.email} onChange={set('email')} placeholder="amit@business.com" />
         </Field>
         <Field label="Password" hint="They can use this to log in; minimum 8 characters">
-          <Input type="password" required minLength={8} value={form.password} onChange={set('password')} />
+          <PasswordInput required minLength={8} value={form.password} onChange={set('password')} />
         </Field>
         <Field label="Account type">
           <Select value={form.role} onChange={set('role')}>

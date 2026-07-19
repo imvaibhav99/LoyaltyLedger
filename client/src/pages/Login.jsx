@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth, homeFor } from '../context/AuthContext.jsx';
 import { apiMessage } from '../api/axios.js';
-import { Button, Field, Input, ErrorNote } from '../components/ui.jsx';
+import { Button, Field, Input, PasswordInput, ErrorNote } from '../components/ui.jsx';
 import { IconCoin, IconCheck } from '../components/icons.jsx';
 
 export function AuthShell({ children }) {
@@ -73,9 +73,16 @@ export default function Login() {
           <Field label="Email">
             <Input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@business.com" />
           </Field>
-          <Field label="Password">
-            <Input type="password" required value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" />
-          </Field>
+          <div>
+            <Field label="Password">
+              <PasswordInput required value={password} onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" />
+            </Field>
+            <div className="mt-1.5 text-right">
+              <Link to="/forgot-password" className="text-sm font-medium text-brand-600 hover:underline">
+                Forgot password?
+              </Link>
+            </div>
+          </div>
           <ErrorNote>{error}</ErrorNote>
           <Button type="submit" disabled={busy} className="w-full justify-center">
             {busy ? 'Logging in…' : 'Log in'}

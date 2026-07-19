@@ -1,5 +1,5 @@
-import { useEffect } from 'react';
-import { IconX, IconAlert } from './icons.jsx';
+import { useEffect, useState } from 'react';
+import { IconX, IconAlert, IconEye, IconEyeOff } from './icons.jsx';
 
 export const inr = (n) => `₹${Number(n ?? 0).toLocaleString('en-IN')}`;
 export const num = (n) => Number(n ?? 0).toLocaleString('en-IN');
@@ -34,8 +34,26 @@ export function Field({ label, hint, children }) {
 const inputCls =
   'w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100';
 
-export function Input(props) {
-  return <input className={inputCls} {...props} />;
+export function Input({ className = '', ...props }) {
+  return <input className={`${inputCls} ${className}`} {...props} />;
+}
+
+export function PasswordInput(props) {
+  const [show, setShow] = useState(false);
+  return (
+    <div className="relative">
+      <input className={`${inputCls} pr-10`} type={show ? 'text' : 'password'} {...props} />
+      <button
+        type="button"
+        tabIndex={-1}
+        aria-label={show ? 'Hide password' : 'Show password'}
+        onClick={() => setShow((s) => !s)}
+        className="absolute inset-y-0 right-0 flex items-center px-3 text-gray-400 hover:text-gray-600"
+      >
+        {show ? <IconEyeOff size={18} /> : <IconEye size={18} />}
+      </button>
+    </div>
+  );
 }
 export function Select({ children, ...props }) {
   return (
